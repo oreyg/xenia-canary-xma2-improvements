@@ -71,7 +71,9 @@ DEFINE_string(
     " old: \n  Decoder based on master version of decoder with few "
     "improvements.\n"
     " new: \n  New version of decoder. Provides highest stability, but isn't "
-    "yet finished.\n",
+    "yet finished.\n"
+    " v3: \n  Version of decoder that is closest to the ReXGlue. Has "
+    "better handing of skipped frames.",
     "APU");
 
 namespace xe {
