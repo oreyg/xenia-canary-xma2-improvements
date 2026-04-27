@@ -14,6 +14,7 @@
 #include "xenia/apu/xma_context_master.h"
 #include "xenia/apu/xma_context_new.h"
 #include "xenia/apu/xma_context_old.h"
+#include "xenia/apu/xma_context_v3.h"
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -158,6 +159,8 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
       contexts_[i] = new XmaContextOld();
     } else if (cvars::xma_decoder == "new") {
       contexts_[i] = new XmaContextNew();
+    } else if (cvars::xma_decoder == "v3") {
+      contexts_[i] = new XmaContextV3();
     } else {
       contexts_[i] = new XmaContextNew();
     }

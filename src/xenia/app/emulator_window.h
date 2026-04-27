@@ -269,6 +269,7 @@ class EmulatorWindow {
   void CpuTimeScalarSetDouble();
   void CpuBreakIntoDebugger();
   void CpuBreakIntoHostDebugger();
+  void ApuToggleXmaFrameDump();
   void GpuTraceFrame();
   void GpuClearCaches();
   void ToggleDisplayConfigDialog();

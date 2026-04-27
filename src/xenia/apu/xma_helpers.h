@@ -18,6 +18,14 @@ namespace xe {
 namespace apu {
 namespace xma {
 
+static constexpr uint32_t kBytesPerPacket = 2048;
+static constexpr uint32_t kBytesPerPacketHeader = 4;
+static constexpr uint32_t kBytesPerPacketData =
+    kBytesPerPacket - kBytesPerPacketHeader;
+static constexpr uint32_t kBitsPerPacket = kBytesPerPacket * 8;
+static constexpr uint32_t kBitsPerPacketHeader = 32;
+static constexpr uint32_t kBitsPerFrameHeader = 15;
+
 static constexpr uint32_t kMaxFrameLength = 0x7FFF;
 
 // Get number of frames that /begin/ in this packet. This is valid only for XMA2

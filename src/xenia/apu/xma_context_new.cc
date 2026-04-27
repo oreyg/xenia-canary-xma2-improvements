@@ -8,6 +8,7 @@
 */
 
 #include "xenia/apu/xma_context_new.h"
+#include "xenia/apu/xma_frame_dumper.h"
 #include "xenia/apu/xma_helpers.h"
 
 #include "xenia/base/logging.h"
@@ -568,6 +569,13 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
 
   PrepareDecoder(data->sample_rate, bool(data->is_stereo));
   PreparePacket(packet_info.current_frame_size_, padding_start);
+
+  XmaFrameDumper::RecordFrame(
+      id(), static_cast<uint32_t>(GetSampleRate(data->sample_rate)),
+      data->is_stereo ? 2 : 1, static_cast<uint8_t>(data->current_buffer),
+      static_cast<uint16_t>(packet_index), data->input_buffer_read_offset,
+      av_packet_->data, av_packet_->size);
+
   if (DecodePacket(av_context_, av_packet_, av_frame_)) {
     // dump_raw(av_frame_, id());
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data),

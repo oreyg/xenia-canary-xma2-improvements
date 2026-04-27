@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "xenia/apu/xma_decoder.h"
+#include "xenia/apu/xma_frame_dumper.h"
 #include "xenia/apu/xma_helpers.h"
 #include "xenia/base/bit_stream.h"
 #include "xenia/base/logging.h"
@@ -559,6 +560,12 @@ void XmaContextMaster::Decode(XMA_CONTEXT_DATA* data) {
     split_frame_len_ = 0;
     split_frame_len_partial_ = 0;
     split_frame_padding_start_ = 0;
+
+    XmaFrameDumper::RecordFrame(
+        id(), static_cast<uint32_t>(GetSampleRate(data->sample_rate)),
+        data->is_stereo ? 2 : 1, static_cast<uint8_t>(data->current_buffer),
+        static_cast<uint16_t>(packet_idx), data->input_buffer_read_offset,
+        av_packet_->data, av_packet_->size);
 
     auto ret = avcodec_send_packet(av_context_, av_packet_);
     if (ret < 0) {

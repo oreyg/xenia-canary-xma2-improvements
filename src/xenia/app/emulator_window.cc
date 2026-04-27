@@ -19,6 +19,7 @@
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+#include "xenia/apu/xma_frame_dumper.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -826,6 +827,15 @@ bool EmulatorWindow::Initialize() {
   }
   main_menu->AddChild(std::move(cpu_menu));
 
+  // APU menu.
+  auto apu_menu = MenuItem::Create(MenuItem::Type::kPopup, "&APU");
+  {
+    apu_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Toggle &XMA Frame Dump", "",
+        std::bind(&EmulatorWindow::ApuToggleXmaFrameDump, this)));
+  }
+  main_menu->AddChild(std::move(apu_menu));
+
   // GPU menu.
   auto gpu_menu = MenuItem::Create(MenuItem::Type::kPopup, "&GPU");
   {
@@ -1530,6 +1540,30 @@ void EmulatorWindow::CpuBreakIntoDebugger() {
 }
 
 void EmulatorWindow::CpuBreakIntoHostDebugger() { xe::debugging::Break(); }
+
+void EmulatorWindow::ApuToggleXmaFrameDump() {
+  if (apu::XmaFrameDumper::IsEnabled()) {
+    const std::string path = apu::XmaFrameDumper::xframes_path();
+    apu::XmaFrameDumper::Disable();
+    new xe::ui::HostNotificationWindow(imgui_drawer(), "XMA Frame Dump",
+                                       fmt::format("Stopped: {}", path), 0);
+    return;
+  }
+  std::string title_id = "global";
+  if (emulator() && emulator()->title_id()) {
+    title_id = fmt::format("{:08X}", emulator()->title_id());
+  }
+  auto output_dir =
+      xe::filesystem::GetExecutableFolder() / "xma_dumps" / title_id;
+  if (apu::XmaFrameDumper::Enable(output_dir)) {
+    new xe::ui::HostNotificationWindow(
+        imgui_drawer(), "XMA Frame Dump",
+        fmt::format("Capturing to {}", apu::XmaFrameDumper::xframes_path()), 0);
+  } else {
+    new xe::ui::HostNotificationWindow(imgui_drawer(), "XMA Frame Dump",
+                                       "Failed to start dump (see log).", 0);
+  }
+}
 
 void EmulatorWindow::GpuTraceFrame() {
   emulator()->graphics_system()->RequestFrameTrace();

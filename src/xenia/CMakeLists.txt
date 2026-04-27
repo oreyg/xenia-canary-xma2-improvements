@@ -44,6 +44,9 @@ add_subdirectory(apu/sdl)
 add_subdirectory(helper/sdl)
 add_subdirectory(hid/sdl)
 
+# Tools
+add_subdirectory(tools/xma_replay)
+
 # Platform-conditional modules
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_subdirectory(apu/alsa)
