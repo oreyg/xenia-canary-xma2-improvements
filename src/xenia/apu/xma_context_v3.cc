@@ -542,7 +542,7 @@ void XmaContextV3::Decode(XMA_CONTEXT_DATA* data) {
   last_decode_succeeded_ = false;
   last_error_status_ = static_cast<uint32_t>(data->error_status);
 
-  auto log_decode_state = [&](const char* reason) {
+  auto log_decode_state_warning = [&](const char* reason) {
     XELOGW(
         "XmaContextV3 {}: {} cur_buf={} v0={} v1={} out_valid={} "
         "read_before={} read_after={} pkt_idx={} next={} pkt_count={} "
@@ -610,7 +610,7 @@ void XmaContextV3::Decode(XMA_CONTEXT_DATA* data) {
   if (packet_index == -1) {
     XELOGE("XmaContextV3 {}: Invalid packet index. Input read offset: {}", id(),
            static_cast<uint32_t>(data->input_buffer_read_offset));
-    log_decode_state("invalid-packet-index");
+    log_decode_state_warning("invalid-packet-index");
     return;
   }
 
@@ -631,7 +631,7 @@ void XmaContextV3::Decode(XMA_CONTEXT_DATA* data) {
     data->input_buffer_read_offset = next_input_offset;
     last_input_read_offset_after_ =
         static_cast<uint32_t>(data->input_buffer_read_offset);
-    log_decode_state(reason);
+    log_decode_state_warning(reason);
   };
 
   uint8_t* packet = current_input_buffer + (packet_index * kBytesPerPacket);
@@ -682,7 +682,7 @@ void XmaContextV3::Decode(XMA_CONTEXT_DATA* data) {
       SwapInputBuffer(data);
       last_input_read_offset_after_ =
           static_cast<uint32_t>(data->input_buffer_read_offset);
-      log_decode_state("missing-next-packet-for-split-frame");
+      log_decode_state_warning("missing-next-packet-for-split-frame");
       return;
     }
     last_cross_packet_copy_ = true;
@@ -691,7 +691,7 @@ void XmaContextV3::Decode(XMA_CONTEXT_DATA* data) {
     if (packet_info.current_frame_size == 0) {
       data->error_status = 4;
       last_error_status_ = static_cast<uint32_t>(data->error_status);
-      log_decode_state("split-frame-size-invalid");
+      log_decode_state_warning("split-frame-size-invalid");
       return;
     }
   }
@@ -719,7 +719,7 @@ void XmaContextV3::Decode(XMA_CONTEXT_DATA* data) {
     if (!next_packet) {
       data->error_status = 4;
       last_error_status_ = static_cast<uint32_t>(data->error_status);
-      log_decode_state("missing-next-packet-last-frame");
+      log_decode_state_warning("missing-next-packet-last-frame");
       return;
     }
     last_cross_packet_copy_ = true;
@@ -794,7 +794,7 @@ void XmaContextV3::Decode(XMA_CONTEXT_DATA* data) {
           memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
 
       if (next_input_offset > kMaxFrameSizeinBits) {
-        log_decode_state("next-packet-frame-offset-invalid");
+        log_decode_state_warning("next-packet-frame-offset-invalid");
         last_swapped_input_buffer_ = true;
         SwapInputBuffer(data);
         return;

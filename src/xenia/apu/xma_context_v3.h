@@ -29,10 +29,34 @@ struct AVPacket;
 namespace xe {
 namespace apu {
 
-// Same overall shape as XmaContextNew (AV_CODEC_ID_XMAFRAMES, bit-level walk,
-// Decode/Consume split) but adopts fixes from AC6 RECOMP. Mainly:
-//   - skip_corrupt_packet recovery on bad packet headers / split frames
-//   - GetNextPacket / GetNextPacketReadOffset crossing buffer boundaries
+// Same overall shape as XmaContextNew, but adopts fixes from RexGlue SDK.
+// Differences:
+//
+// Packet walk across buffer boundaries:
+//   - GetNextPacket
+//      Carries next_packet_index across the boundary instead of clamping
+//      to the next input buffer's first packet; bounds-checked.
+//   - GetNextPacketReadOffset
+//      Scans into the next input buffer for the first-frame offset
+//      instead of just signalling a swap.
+//
+// Failure recovery:
+//   - Recovers from corrupt packets by skipping them and flagging an error,
+//     rather than stalling the decoder.
+//   - Cross-packet body detection is explicit (needs_next_for_body) rather
+//     than implied by isLastFrameInPacket + BitsRemaining.
+//   - Release()/Clear() fully reset internal decoder state
+//     (subframe counter, loop limits, etc).
+//
+// Refactor:
+//   - Logic, that traverses frames inside a packet is extracted into a
+//     separate helper (InspectPacket, ResolveSplitFrameSize,
+//     BuildAvPacketPayload).
+//
+// Diagnostics:
+//   - Decode() records a snapshot of the current decoder state for
+//     diagnostic purposes (log_level >= 1).
+//
 class XmaContextV3 : public XmaContext {
  public:
   static constexpr uint32_t kBitsPerPacketHeader = 32;
