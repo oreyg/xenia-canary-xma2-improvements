@@ -65,15 +65,15 @@ DEFINE_bool(use_dedicated_xma_thread, true,
 DEFINE_string(
     xma_decoder, "new",
     "Decoder version used to process XMA audio.\n"
-    "Use: [fake, master, old, new]\n"
+    "Use: [fake, master, old, new, v3]\n"
     " fake: \n  No audio will be decoded.\n"
     " master: \n  Version of decoder exactly like on base version of Xenia.\n"
     " old: \n  Decoder based on master version of decoder with few "
     "improvements.\n"
     " new: \n  New version of decoder. Provides highest stability, but isn't "
     "yet finished.\n"
-    " v3: \n  Decoder derived from the RexGlue SDK. Under evaluation. \n"
-    "         More forgiving towards unsupported XMA features. \n",
+    " v3: \n  Decoder derived from the RexGlue SDK. Under evaluation. "
+    "More forgiving towards unsupported XMA features.\n",
     "APU");
 
 namespace xe {
