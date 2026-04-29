@@ -14,6 +14,17 @@
 #include <string>
 #include <thread>
 
+#include "xenia/base/platform.h"
+
+#if XE_PLATFORM_WIN32
+// Force mimalloc.dll into the import table so mimalloc-redirect.dll can
+// hook the CRT allocator before any other allocation occurs. Pair with the
+// new/delete override below for the C++ side.
+#pragma comment(linker, "/include:mi_version")
+#include "third_party/mimalloc/include/mimalloc.h"
+#include "third_party/mimalloc/include/mimalloc-new-delete.h"
+#endif
+
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/assert.h"

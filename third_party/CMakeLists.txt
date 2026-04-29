@@ -185,6 +185,65 @@ target_include_directories(mspack PUBLIC mspack)
 target_link_libraries(mspack PUBLIC xenia-base)
 
 # ==============================================================================
+# mimalloc (Windows only - DLL with mimalloc-redirect to override CRT malloc)
+# ==============================================================================
+if(WIN32)
+  set(_mimalloc_sources
+    mimalloc/src/alloc.c
+    mimalloc/src/alloc-aligned.c
+    mimalloc/src/alloc-posix.c
+    mimalloc/src/arena.c
+    mimalloc/src/arena-meta.c
+    mimalloc/src/bitmap.c
+    mimalloc/src/heap.c
+    mimalloc/src/init.c
+    mimalloc/src/libc.c
+    mimalloc/src/options.c
+    mimalloc/src/os.c
+    mimalloc/src/page.c
+    mimalloc/src/page-map.c
+    mimalloc/src/random.c
+    mimalloc/src/stats.c
+    mimalloc/src/theap.c
+    mimalloc/src/threadlocal.c
+    mimalloc/src/prim/prim.c
+  )
+  add_library(mimalloc SHARED ${_mimalloc_sources})
+  target_include_directories(mimalloc PUBLIC mimalloc/include)
+  target_compile_definitions(mimalloc PRIVATE MI_SHARED_LIB MI_SHARED_LIB_EXPORT)
+
+  # Pick the right architecture-specific redirect DLL.
+  if(XE_TARGET_AARCH64)
+    set(_mimalloc_redirect_suffix "-arm64")
+  else()
+    set(_mimalloc_redirect_suffix "")
+  endif()
+  set(_mimalloc_redirect_dll
+    "${CMAKE_CURRENT_SOURCE_DIR}/mimalloc/bin/mimalloc-redirect${_mimalloc_redirect_suffix}.dll")
+  set(_mimalloc_redirect_lib
+    "${CMAKE_CURRENT_SOURCE_DIR}/mimalloc/bin/mimalloc-redirect${_mimalloc_redirect_suffix}.lib")
+
+  target_link_libraries(mimalloc PRIVATE
+    ${_mimalloc_redirect_lib}
+    psapi shell32 user32 advapi32 bcrypt
+  )
+
+  # Per upstream CMakeLists: with MSVC the sources must be compiled as C++ to
+  # use modern C++ atomics. clang-cl shares the MSVC frontend.
+  if(MSVC)
+    set_source_files_properties(${_mimalloc_sources} PROPERTIES LANGUAGE CXX)
+  endif()
+
+  # Copy mimalloc-redirect.dll next to the produced mimalloc.dll (which is
+  # also the runtime output dir for xenia-app, so it sits beside xenia_canary.exe).
+  add_custom_command(TARGET mimalloc POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${_mimalloc_redirect_dll}" "$<TARGET_FILE_DIR:mimalloc>"
+    COMMENT "Copying mimalloc-redirect${_mimalloc_redirect_suffix}.dll to output directory"
+  )
+endif()
+
+# ==============================================================================
 # pugixml
 # ==============================================================================
 add_library(pugixml STATIC

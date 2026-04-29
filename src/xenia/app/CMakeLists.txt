@@ -106,6 +106,7 @@ endif()
 # Platform-specific libraries
 if(WIN32)
   target_link_libraries(xenia-app PRIVATE
+    mimalloc
     xenia-apu-xaudio2
     xenia-gpu-d3d12
     xenia-hid-winkey
