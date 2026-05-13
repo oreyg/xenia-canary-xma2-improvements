@@ -526,6 +526,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     gamma_render_target_as_unorm16_ = false;
 
     depth_float24_round_ = cvars::depth_float24_round;
+    depth_float24_convert_in_pixel_shader_ =
+        cvars::depth_float24_convert_in_pixel_shader;
 
     // Host depth storing pipeline layout.
     VkDescriptorSetLayout host_depth_store_descriptor_set_layouts[] = {
@@ -729,8 +731,10 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // Piecewise linear gamma is 8-bit with programmable blending.
     gamma_render_target_as_unorm16_ = false;
 
-    // Always true float24 depth rounded to the nearest even.
+    // Always true float24 depth rounded to the nearest even. FSI manages its
+    // own depth and does not use the pixel-shader convert path.
     depth_float24_round_ = true;
+    depth_float24_convert_in_pixel_shader_ = false;
 
     // The pipeline layout and the pipelines for clearing the EDRAM buffer in
     // resolves.

@@ -41,8 +41,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // Early fragment tests - enable if alpha test and alpha to coverage are
       // disabled; ignored if anything in the shader blocks early Z writing.
       kEarlyHint,
-      // TODO(Triang3l): Unorm24 (rounding) and float24 (truncating and
-      // rounding) output modes.
+      // Convert host 32-bit depth to 20e4 float24 and back inside the
+      // pixel shader by simple bit truncation, then write the result to
+      // gl_FragDepth.
+      // Used when depth_float24_convert_in_pixel_shader is
+      // enabled and the depth format is D24FS8.
+      kFloat24Truncating,
+      // Like kFloat24Truncating but using rounding to the nearest even
+      kFloat24Rounding,
     };
 
     struct {
@@ -65,6 +71,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // If user_clip_plane_count is non-zero, whether they should be cull
       // distances instead of clip distances.
       uint32_t user_clip_plane_cull : 1;
+      // Whether the shader uses oPts.z (the vertex-kill register) and the AND
+      // operator is in effect).
+      uint32_t vertex_kill_and : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -540,6 +549,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
            current_shader().implicit_early_z_write_allowed();
   }
 
+  // Whether we should convert depth value to a 20e4 float24 in pixel shader.
+  // Only meaningful for the FBO (non-FSI) path -
+  // FSI manages its own depth and stencil entirely through the EDRAM buffer.
+  bool DSV_IsWritingFloat24Depth() const {
+    if (edram_fragment_shader_interlock_) {
+      return false;
+    }
+    Modification::DepthStencilMode depth_stencil_mode =
+        GetSpirvShaderModification().pixel.depth_stencil_mode;
+    return depth_stencil_mode ==
+               Modification::DepthStencilMode::kFloat24Truncating ||
+           depth_stencil_mode ==
+               Modification::DepthStencilMode::kFloat24Rounding;
+  }
+
   uint32_t GetModificationInterpolatorMask() const {
     Modification modification = GetSpirvShaderModification();
     return is_vertex_shader() ? modification.vertex.interpolator_mask
@@ -562,6 +586,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
   void CompleteFragmentShaderInMain();
+
+  // Writes gl_FragDepth at the end of an FBO pixel shader.
+  // Handles both remapping guest->host and float24 truncation / rounding.
+  // No-op for FSI and for shaders that do not need a host depth output.
+  void CompleteFragmentShader_DSV_DepthTo24Bit();
 
   // Updates the current flow control condition (to be called in the beginning
   // of exec and in jumps), closing the previous conditionals if needed.
@@ -960,10 +989,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // output_or_var_fragment_data_.
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_fragment_data_;
 
-  // Fragment shader depth output (gl_FragDepth).
-  // With fragment shader interlock, a variable in the main function.
-  // Otherwise, the depth output (only created if shader writes depth).
+  // Fragment shader depth output (a staging variable).
+  // Used by both FSI (which writes its value to the EDRAM buffer inside the
+  // interlock) and FBO (copied with optional float24 conversion to
+  // output_fragment_depth_ at the end of the shader).
   spv::Id output_or_var_fragment_depth_;
+
+  // FBO only: actual gl_FragDepth Output. Written at the end of the pixel
+  // shader from output_or_var_fragment_depth_, optionally routed through a
+  // float24 conversion when DSV_IsWritingFloat24Depth() is true.
+  spv::Id output_fragment_depth_;
 
   // Fragment shader sample mask output (gl_SampleMask).
   // Only used for alpha-to-coverage in non-FSI mode.

@@ -1483,6 +1483,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     }
   }
 
+  // Copies the staged depth to FSO output to gl_FragDepth.
+  // No-op for FSI and when no host depth output was declared.
+  CompleteFragmentShader_DSV_DepthTo24Bit();
+
   if (edram_fragment_shader_interlock_) {
     if (block_fsi_if_after_depth_stencil_merge) {
       builder_->createBranch(block_fsi_if_after_depth_stencil_merge);
@@ -1501,6 +1505,150 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
 
     builder_->createNoResultOp(spv::OpEndInvocationInterlockEXT);
   }
+}
+
+void SpirvShaderTranslator::CompleteFragmentShader_DSV_DepthTo24Bit() {
+  // FSI manages its own depth via the EDRAM buffer - this hook is FBO-only.
+  // Likewise, if no Output FragDepth was declared, there is nothing to write.
+  if (edram_fragment_shader_interlock_ ||
+      output_fragment_depth_ == spv::NoResult) {
+    return;
+  }
+
+  bool shader_writes_depth = current_shader().writes_depth();
+
+  if (!DSV_IsWritingFloat24Depth()) {
+    if (shader_writes_depth) {
+      // If not converting, but the shader writes depth explicitly, for float24,
+      // need to scale it from guest 0...1 to host 0...0.5 to support
+      // reinterpretation round trips as viewport scaling doesn't apply to
+      // oDepth.
+      spv::Id depth_value =
+          builder_->createLoad(output_or_var_fragment_depth_, spv::NoPrecision);
+      spv::Id depth_float24_flag = builder_->createBinOp(
+          spv::OpINotEqual, type_bool_,
+          builder_->createBinOp(
+              spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+              builder_->makeUintConstant(kSysFlag_DepthFloat24)),
+          const_uint_0_);
+      spv::Id depth_scaled =
+          builder_->createBinOp(spv::OpFMul, type_float_, depth_value,
+                                builder_->makeFloatConstant(0.5f));
+      spv::Id depth_remapped =
+          builder_->createTriOp(spv::OpSelect, type_float_, depth_float24_flag,
+                                depth_scaled, depth_value);
+      // Write the depth from the temporary to the system depth output.
+      builder_->createStore(depth_remapped, output_fragment_depth_);
+    }
+    return;
+  }
+
+  spv::Id depth_value;
+  if (shader_writes_depth) {
+    // The depth is already written to output_or_var_fragment_depth_ and
+    // clamped to 0...1 with NaNs dropped (saturating in StoreResult).
+    depth_value =
+        builder_->createLoad(output_or_var_fragment_depth_, spv::NoPrecision);
+  } else {
+    // Need a temporary variable; remap the sample's depth input from host
+    // 0...0.5 back to guest 0...1 for conversion purposes to it and saturate it
+    // (in Vulkan / Direct3D 11+, depth is clamped to the viewport bounds after
+    // the pixel shader, and gl_FragCoord.z contains the unclamped depth, which
+    // may be outside the viewport's depth range if it's biased); though it
+    // will be clamped to the viewport bounds anyway, but to be able to make
+    // the assumption of it being clamped while working with the bit
+    // representation.
+    assert_true(input_fragment_coordinates_ != spv::NoResult);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(2));
+    spv::Id frag_coord_z =
+        builder_->createLoad(builder_->createAccessChain(
+                                 spv::StorageClassInput,
+                                 input_fragment_coordinates_, id_vector_temp_),
+                             spv::NoPrecision);
+    spv::Id z_times_2 =
+        builder_->createBinOp(spv::OpFMul, type_float_, frag_coord_z,
+                              builder_->makeFloatConstant(2.0f));
+    depth_value = builder_->createTriBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, z_times_2,
+        const_float_0_, const_float_1_);
+  }
+
+  spv::Id converted;
+  Modification::DepthStencilMode mode =
+      GetSpirvShaderModification().pixel.depth_stencil_mode;
+  if (mode == Modification::DepthStencilMode::kFloat24Truncating) {
+    // Simplified conversion, always less than or equal to the original value -
+    // just drop the lower bits.
+    // The float32 exponent bias is 127.
+    // After saturating, the exponent range is -127...0.
+    // The smallest normalized 20e4 exponent is -14 - should drop 3 mantissa
+    // bits at -14 or above.
+    // The smallest denormalized 20e4 number is -34 - should drop 23 mantissa
+    // bits at -34.
+    // Anything smaller than 2^-34 becomes 0.
+    spv::Id value_uint =
+        builder_->createUnaryOp(spv::OpBitcast, type_uint_, depth_value);
+    // Check if the number is representable as a float24 after truncation - the
+    // exponent is at least -34.
+    spv::Id is_representable =
+        builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, value_uint,
+                              builder_->makeUintConstant(0x2E800000));
+    SpirvBuilder::IfBuilder if_representable(
+        is_representable, spv::SelectionControlMaskNone, *builder_);
+    spv::Id truncated;
+    {
+      // Extract the biased float32 exponent.
+      // exponent = 113+ at -14+.
+      // exponent = 93 at -34.
+      spv::Id biased_exponent = builder_->createTriOp(
+          spv::OpBitFieldUExtract, type_uint_, value_uint,
+          builder_->makeUintConstant(23), builder_->makeUintConstant(8));
+      // Convert exponent to the unclamped number of bits to truncate.
+      // 116 - 113 = 3.
+      // 116 - 93 = 23.
+      // drop_bits = 3+ at exponent -14+.
+      // drop_bits = 23 at exponent -34.
+      spv::Id drop_bits_signed = builder_->createBinOp(
+          spv::OpISub, type_int_, builder_->makeIntConstant(116),
+          builder_->createUnaryOp(spv::OpBitcast, type_int_, biased_exponent));
+      // Clamp the truncated bit count to drop 3 bits of any normal number.
+      // Exponents below -34 are handled separately.
+      // drop_bits = 3 at exponent -14.
+      // drop_bits = 23 at exponent -34.
+      spv::Id drop_bits = builder_->createBinBuiltinCall(
+          type_int_, ext_inst_glsl_std_450_, GLSLstd450SMax, drop_bits_signed,
+          builder_->makeIntConstant(3));
+      spv::Id drop_bits_uint =
+          builder_->createUnaryOp(spv::OpBitcast, type_uint_, drop_bits);
+      // Truncate the mantissa - fill the low bits with zeros.
+      // mantissa_truncated = result in 0...1 range
+      spv::Id mantissa_truncated =
+          builder_->createQuadOp(spv::OpBitFieldInsert, type_uint_, value_uint,
+                                 const_uint_0_, const_uint_0_, drop_bits_uint);
+      spv::Id mantissa_truncated_f = builder_->createUnaryOp(
+          spv::OpBitcast, type_float_, mantissa_truncated);
+      // Remap from guest 0...1 to host 0...0.5.
+      truncated =
+          builder_->createBinOp(spv::OpFMul, type_float_, mantissa_truncated_f,
+                                builder_->makeFloatConstant(0.5f));
+    }
+    // The number is not representable as float24 after truncation - zero.
+    if_representable.makeEndIf();
+    // Close the non-zero result check.
+    converted = if_representable.createMergePhi(truncated, const_float_0_);
+  } else {
+    // Properly convert to 20e4, with rounding to the nearest even (the bias
+    // was pre-applied by multiplying by 2), then convert back restoring the
+    // bias.
+    spv::Id encoded = PreClampedDepthTo20e4(
+        *builder_, depth_value, /*round_to_nearest_even=*/true,
+        /*remap_from_0_to_0_5=*/false, ext_inst_glsl_std_450_);
+    converted = Depth20e4To32(*builder_, encoded, /*f24_shift=*/0,
+                              /*remap_to_0_to_0_5=*/true,
+                              /*result_as_uint=*/false, ext_inst_glsl_std_450_);
+  }
+  builder_->createStore(converted, output_fragment_depth_);
 }
 
 spv::Id SpirvShaderTranslator::LoadMsaaSamplesFromFlags() {

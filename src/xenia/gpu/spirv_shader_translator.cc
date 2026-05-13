@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
@@ -145,6 +146,8 @@ void SpirvShaderTranslator::Reset() {
   var_main_fsi_color_written_ = spv::NoResult;
   std::fill(output_fragment_data_.begin(), output_fragment_data_.end(),
             spv::NoResult);
+  output_or_var_fragment_depth_ = spv::NoResult;
+  output_fragment_depth_ = spv::NoResult;
 
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
@@ -723,9 +726,17 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       builder_->addExecutionMode(function_main_,
                                  spv::ExecutionModeEarlyFragmentTests);
     }
-    if (current_shader().writes_depth()) {
+    if (current_shader().writes_depth() || DSV_IsWritingFloat24Depth()) {
       builder_->addExecutionMode(function_main_,
                                  spv::ExecutionModeDepthReplacing);
+      // For float24 truncation, the converted depth is always less or equal the
+      // value originally interpolated by the rasterizer. Rounding mode can move
+      // either direction and disables conservative depth (and thus early-Z).
+      if (GetSpirvShaderModification().pixel.depth_stencil_mode ==
+              Modification::DepthStencilMode::kFloat24Truncating &&
+          !current_shader().writes_depth()) {
+        builder_->addExecutionMode(function_main_, spv::ExecutionModeDepthLess);
+      }
     }
     if (edram_fragment_shader_interlock_) {
       // Accessing per-sample values, so interlocking just when there's common
@@ -1324,13 +1335,19 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
   struct_per_vertex_members.reserve(kOutputPerVertexMemberCount);
   struct_per_vertex_members.push_back(type_float4_);
 
-  // Only allocate ClipDistance/CullDistance arrays when user clip planes are
-  // actually enabled (count > 0).
+  // Only declare the Clip/Cull arrays we actually write. An unwritten BuiltIn
+  // array still participates in clipping/culling with undefined values.
   uint32_t user_clip_plane_count =
       shader_modification.vertex.user_clip_plane_count;
+  bool user_clip_plane_cull = shader_modification.vertex.user_clip_plane_cull;
+  bool vertex_kill_and = shader_modification.vertex.vertex_kill_and;
+  uint32_t clip_distance_count =
+      user_clip_plane_cull ? 0 : user_clip_plane_count;
+  uint32_t cull_distance_count =
+      (user_clip_plane_cull ? user_clip_plane_count : 0) +
+      (vertex_kill_and ? 1 : 0);
   output_per_vertex_clip_distance_member_index_ = 0;
   output_per_vertex_cull_distance_member_index_ = 0;
-  constexpr uint32_t kMaxUserClipPlanes = 6;
   if (user_clip_plane_count > 0) {
     // Create separate uniform buffer for clip planes.
     spv::Id type_float4_array_6 = builder_->makeArrayType(
@@ -1356,16 +1373,18 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(uniform_clip_plane_constants_);
     }
-
+  }
+  if (clip_distance_count > 0) {
     output_per_vertex_clip_distance_member_index_ =
         static_cast<unsigned int>(struct_per_vertex_members.size());
     struct_per_vertex_members.push_back(builder_->makeArrayType(
-        type_float_, builder_->makeUintConstant(user_clip_plane_count), 0));
-
+        type_float_, builder_->makeUintConstant(clip_distance_count), 0));
+  }
+  if (cull_distance_count > 0) {
     output_per_vertex_cull_distance_member_index_ =
         static_cast<unsigned int>(struct_per_vertex_members.size());
     struct_per_vertex_members.push_back(builder_->makeArrayType(
-        type_float_, builder_->makeUintConstant(user_clip_plane_count), 0));
+        type_float_, builder_->makeUintConstant(cull_distance_count), 0));
   }
 
   spv::Id type_struct_per_vertex =
@@ -1376,15 +1395,15 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
       type_struct_per_vertex, kOutputPerVertexMemberPosition,
       spv::DecorationBuiltIn, static_cast<int>(spv::BuiltIn::Position));
 
-  // Decorate clip/cull arrays only if allocated.
-  if (user_clip_plane_count > 0) {
+  if (clip_distance_count > 0) {
     builder_->addMemberName(type_struct_per_vertex,
                             output_per_vertex_clip_distance_member_index_,
                             "gl_ClipDistance");
     builder_->addMemberDecoration(
         type_struct_per_vertex, output_per_vertex_clip_distance_member_index_,
         spv::DecorationBuiltIn, static_cast<int>(spv::BuiltIn::ClipDistance));
-
+  }
+  if (cull_distance_count > 0) {
     builder_->addMemberName(type_struct_per_vertex,
                             output_per_vertex_cull_distance_member_index_,
                             "gl_CullDistance");
@@ -1940,6 +1959,73 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
     }
   }
 
+  // Vertex kill:
+  // AND -> -1 in a trailing CullDistance slot
+  // OR  -> NaN in gl_Position.w.
+  // See CompleteVertexShaderCode in dxbc_shader_translator.cc.
+  {
+    bool shader_writes_vertex_kill =
+        (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b100) !=
+        0;
+    bool emit_vertex_kill_and = shader_modification.vertex.vertex_kill_and;
+    bool emit_vertex_kill_or =
+        !emit_vertex_kill_and && shader_writes_vertex_kill;
+    if (emit_vertex_kill_and || emit_vertex_kill_or) {
+      // Compute whether the kill is active when the shader actually writes
+      // the kill register.
+      spv::Id kill_active = spv::NoResult;
+      if (shader_writes_vertex_kill) {
+        assert_true(var_main_point_size_edge_flag_kill_vertex_ !=
+                    spv::NoResult);
+        id_vector_temp_.clear();
+        // Z component of the point_size/edge_flag/kill_vertex var.
+        id_vector_temp_.push_back(builder_->makeIntConstant(2));
+        spv::Id kill_float = builder_->createLoad(
+            builder_->createAccessChain(
+                spv::StorageClassFunction,
+                var_main_point_size_edge_flag_kill_vertex_, id_vector_temp_),
+            spv::NoPrecision);
+        // Bits 0:30 are the kill flag - mask out the sign bit to dodge
+        // negative-zero / denormal-flushing edge cases.
+        spv::Id kill_uint =
+            builder_->createUnaryOp(spv::OpBitcast, type_uint_, kill_float);
+        spv::Id kill_uint_masked = builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_, kill_uint,
+            builder_->makeUintConstant(UINT32_C(0x7FFFFFFF)));
+        kill_active = builder_->createBinOp(spv::OpINotEqual, type_bool_,
+                                            kill_uint_masked, const_uint_0_);
+      }
+      if (emit_vertex_kill_and) {
+        // Trailing slot of gl_CullDistance.
+        uint32_t kill_slot_index =
+            (shader_modification.vertex.user_clip_plane_cull
+                 ? shader_modification.vertex.user_clip_plane_count
+                 : 0);
+        spv::Id kill_distance =
+            kill_active != spv::NoResult
+                ? builder_->createTriOp(spv::OpSelect, type_float_, kill_active,
+                                        builder_->makeFloatConstant(-1.0f),
+                                        const_float_0_)
+                : const_float_0_;
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(
+            int(output_per_vertex_cull_distance_member_index_)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int(kill_slot_index)));
+        spv::Id kill_slot_ptr = builder_->createAccessChain(
+            spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
+        builder_->createStore(kill_distance, kill_slot_ptr);
+      } else {
+        // OR mode: replace position.w with NaN when the kill is active.
+        position_w =
+            builder_->createTriOp(spv::OpSelect, type_float_, kill_active,
+                                  builder_->makeFloatConstant(
+                                      std::numeric_limits<float>::quiet_NaN()),
+                                  position_w);
+      }
+    }
+  }
+
   // Apply the NDC scale and offset for guest to host viewport transformation.
   id_vector_temp_.clear();
   id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantNdcScale));
@@ -2205,7 +2291,11 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       edram_fragment_shader_interlock_ || param_gen_needed ||
       (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_ &&
        current_shader().writes_color_target(0) &&
-       !IsExecutionModeEarlyFragmentTests());
+       !IsExecutionModeEarlyFragmentTests()) ||
+      // float24 conversion in the FBO pixel shader synthesizes the depth from
+      // gl_FragCoord.z when the guest shader does not write oDepth itself.
+      (DSV_IsWritingFloat24Depth() && !is_depth_only_fragment_shader_ &&
+       !current_shader().writes_depth());
   if (need_frag_coord) {
     input_fragment_coordinates_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassInput, type_float4_, "gl_FragCoord");
@@ -2274,6 +2364,21 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         main_interface_.push_back(output_fragment_data_rt);
       }
     }
+  }
+
+  // Fragment depth output (gl_FragDepth) for the FBO path.
+  // Created when the guest pixel shader writes oDepth,
+  // or when float24 conversion has to run in the pixel shader.
+  // In the latter case the value is synthesized from gl_FragCoord.z.
+  // FSI manages its own depth and does not need an Output.
+  if (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_ &&
+      (current_shader().writes_depth() || DSV_IsWritingFloat24Depth())) {
+    output_fragment_depth_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassOutput, type_float_, "gl_FragDepth");
+    builder_->addDecoration(output_fragment_depth_, spv::DecorationBuiltIn,
+                            static_cast<int>(spv::BuiltIn::FragDepth));
+    builder_->addDecoration(output_fragment_depth_, spv::DecorationInvariant);
+    main_interface_.push_back(output_fragment_depth_);
   }
 
   // Sample mask output for alpha-to-coverage.
@@ -2352,14 +2457,14 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
         "xe_var_color_written", const_uint_0_);
   }
 
-  if (edram_fragment_shader_interlock_) {
-    // Initialize depth output variable with fragment shader interlock.
-    output_or_var_fragment_depth_ = spv::NoResult;
-    if (current_shader().writes_depth()) {
-      output_or_var_fragment_depth_ = builder_->createVariable(
-          spv::NoPrecision, spv::StorageClassFunction, type_float_,
-          "xe_var_fragment_depth", const_float_0_);
-    }
+  // Staging variable for guest oDepth writes.
+  // Created whenever the shader uses oDepth:
+  //   * FSI reads it during its EDRAM depth write inside the interlock.
+  //   * FBO copies it to gl_FragDepth at the end of the shader.
+  if (current_shader().writes_depth()) {
+    output_or_var_fragment_depth_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassFunction, type_float_,
+        "xe_var_fragment_depth", const_float_0_);
   }
 
   if (edram_fragment_shader_interlock_ && FSI_IsDepthStencilEarly()) {
@@ -2964,6 +3069,14 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result,
                                            << result.storage_index)),
             var_main_memexport_data_written_);
       }
+    } break;
+    case InstructionStorageTarget::kDepth: {
+      assert_true(is_pixel_shader());
+      assert_true(current_shader().writes_depth());
+      // FBO: output_or_var_fragment_depth_ is the gl_FragDepth Output.
+      // FSI: output_or_var_fragment_depth_ is a function-scoped variable
+      // which the FSI critical section writes to EDRAM later.
+      target_pointer = output_or_var_fragment_depth_;
     } break;
     default:
       // TODO(Triang3l): All storage targets.
