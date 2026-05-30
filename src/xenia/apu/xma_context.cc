@@ -35,6 +35,8 @@ extern "C" {
 namespace xe {
 namespace apu {
 
+std::recursive_mutex XmaContext::global_lock_;
+
 XmaContext::XmaContext()
     : work_completion_event_(
           xe::threading::Event::CreateAutoResetEvent(false)) {}

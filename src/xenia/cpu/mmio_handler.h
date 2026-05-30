@@ -128,6 +128,9 @@ class MMIOHandler {
     bool is_load;
     // Indicates the memory must be swapped.
     bool byte_swap;
+    // 128-bit (V)MOVDQA/MOVDQU.
+    // Indicates that operation must be dispatched as four 32-bit callbacks.
+    bool is_vector_128;
     // Source (for store) or target (for load) register.
     // For x86-64:
     // AX  CX  DX  BX  SP  BP  SI  DI   // REX.R=0

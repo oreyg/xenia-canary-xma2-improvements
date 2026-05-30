@@ -125,6 +125,81 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p,
 #if XE_ARCH_AMD64
   uint8_t i = 0;  // Current byte decode index.
   uint8_t rex = 0;
+  // 2-byte VEX prefix (C5) — currently only used to recognise 128-bit
+  // (V)MOVDQA/MOVDQU operating on the XMA context region. AVX itself doesn't
+  // accept a REX prefix so this path is mutually exclusive with the rex
+  // decoding below.
+  if (p[i] == 0xC5) {
+    uint8_t vex = p[i + 1];
+    // Decode VEX.R (inverted) — extends ModRM.reg into the upper xmm bank.
+    uint8_t vex_r = (vex & 0x80) ? 0 : 1;
+    uint8_t vex_l = (vex >> 2) & 1;  // 0 = 128-bit
+    uint8_t vex_pp = vex & 0x3;      // 1 = 66 (MOVDQA), 2 = F3 (MOVDQU)
+    uint8_t op = p[i + 2];
+    if (vex_l == 0 && (vex_pp == 1 || vex_pp == 2) &&
+        (op == 0x7F || op == 0x6F)) {
+      decoded_out.is_load = (op == 0x6F);
+      decoded_out.byte_swap = false;  // raw byte copy, no swap
+      decoded_out.is_vector_128 = true;
+      i += 3;
+      uint8_t modrm = p[i++];
+      uint8_t mod = (modrm & 0b11000000) >> 6;
+      uint8_t reg = (modrm & 0b00111000) >> 3;
+      uint8_t rm = (modrm & 0b00000111);
+      decoded_out.value_reg = reg + (vex_r ? 8 : 0);
+      decoded_out.mem_has_base = false;
+      decoded_out.mem_has_index = false;
+      decoded_out.mem_scale = 1;
+      decoded_out.mem_displacement = 0;
+      bool has_sib = false;
+      switch (rm) {
+        case 0b100:
+          has_sib = true;
+          break;
+        case 0b101:
+          if (mod == 0b00) {
+            return false;  // RIP-relative not supported
+          }
+          decoded_out.mem_has_base = true;
+          decoded_out.mem_base_reg = rm;
+          break;
+        default:
+          decoded_out.mem_has_base = true;
+          decoded_out.mem_base_reg = rm;
+          break;
+      }
+      if (has_sib) {
+        uint8_t sib = p[i++];
+        decoded_out.mem_scale = 1 << ((sib & 0b11000000) >> 6);
+        uint8_t sib_index = (sib & 0b00111000) >> 3;
+        uint8_t sib_base = (sib & 0b00000111);
+        if (sib_index != 0b100) {
+          decoded_out.mem_has_index = true;
+          decoded_out.mem_index_reg = sib_index;
+          decoded_out.mem_index_size = sizeof(uint64_t);
+        }
+        if (sib_base == 0b101 && mod == 0b00) {
+          return false;  // displacement-only base not supported
+        }
+        decoded_out.mem_has_base = true;
+        decoded_out.mem_base_reg = sib_base;
+      }
+      switch (mod) {
+        case 0b00:
+          break;
+        case 0b01:
+          decoded_out.mem_displacement += int8_t(p[i++]);
+          break;
+        case 0b10:
+          decoded_out.mem_displacement += xe::load<int32_t>(p + i);
+          i += 4;
+          break;
+      }
+      decoded_out.length = i;
+      return true;
+    }
+    return false;
+  }
   if ((p[i] & 0xF0) == 0x40) {
     rex = p[0];
     ++i;
@@ -509,6 +584,34 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
 #endif  // XE_ARCH_ARM64
 
   uint8_t value_reg = decoded_load_store.value_reg;
+
+#if XE_ARCH_AMD64
+  // 128-bit (V)MOVDQA/MOVDQU is dispatched as four sequential 32-bit MMIO
+  // accesses at offsets +0, +4, +8, +12 of the fault address.
+  if (decoded_load_store.is_vector_128) {
+    assert_true(value_reg <= 15);
+    vec128_t& xmm = ex->ModifyXmmRegister(value_reg);
+    if (decoded_load_store.is_load) {
+      for (uint32_t lane = 0; lane < 4; ++lane) {
+        xmm.u32[lane] =
+            xe::byte_swap(range->read(nullptr, range->callback_context,
+                                      fault_guest_virtual_address + lane * 4));
+      }
+    } else {
+      for (uint32_t lane = 0; lane < 4; ++lane) {
+        range->write(nullptr, range->callback_context,
+                     fault_guest_virtual_address + lane * 4,
+                     xe::byte_swap(xmm.u32[lane]));
+      }
+    }
+    if (record_mmio_callback_) {
+      record_mmio_callback_(record_mmio_context_, (void*)ex->pc());
+    }
+    ex->set_resume_pc(rip + decoded_load_store.length);
+    return true;
+  }
+#endif  // XE_ARCH_AMD64
+
   if (decoded_load_store.is_load) {
     // Load of a memory value - read from range, swap, and store in the
     // register.

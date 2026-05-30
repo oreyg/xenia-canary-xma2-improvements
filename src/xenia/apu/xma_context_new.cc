@@ -10,6 +10,7 @@
 #include "xenia/apu/xma_context_new.h"
 #include "xenia/apu/xma_helpers.h"
 
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
@@ -48,6 +49,7 @@ int XmaContextNew::Setup(uint32_t id, Memory* memory, uint32_t guest_ptr) {
   id_ = id;
   memory_ = memory;
   guest_ptr_ = guest_ptr;
+  host_ptr_ = memory->TranslatePhysical(memory->GetPhysicalAddress(guest_ptr));
 
   // Allocate ffmpeg stuff:
   av_packet_ = av_packet_alloc();
@@ -111,14 +113,27 @@ RingBuffer XmaContextNew::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
 }
 
 bool XmaContextNew::Work() {
-  if (!is_enabled() || !is_allocated()) {
-    return false;
+  std::lock_guard lock(global_lock_);
+
+  // Service a deferred Clear() before anything else. The guest-side writer
+  // just flipped the flag and went on; we apply the reset here so it can't
+  // collide with an in-flight Decode/Consume on this context.
+  ClearOp op =
+      clear_pending_.exchange(ClearOp::kNone, std::memory_order_acq_rel);
+  if (op != ClearOp::kNone) {
+    uint8_t* context_ptr = host_ptr_;
+    XMA_CONTEXT_DATA data(context_ptr);
+    ClearLocked(&data, op);
+    data.Store(context_ptr);
+    return true;
   }
 
-  std::lock_guard<xe_mutex> lock(lock_);
+  if (!is_enabled()) {
+    return false;
+  }
   set_is_enabled(false);
 
-  auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+  uint8_t* context_ptr = host_ptr_;
   XMA_CONTEXT_DATA data(context_ptr);
   const XMA_CONTEXT_DATA initial_data = data;
 
@@ -134,7 +149,8 @@ bool XmaContextNew::Work() {
     if (current_frame_remaining_subframes_ == 0) {
       return true;
     }
-    XELOGAPU("XmaContext {}: Consume-only context, draining subframes", id());
+    XELOGAPU("[{}ms] XmaContext {}: Consume-only context, draining subframes",
+             Clock::QueryHostUptimeMillis(), id());
     Consume(&output_rb, &data);
     data.output_buffer_write_offset =
         output_rb.write_offset() / kOutputBytesPerBlock;
@@ -232,43 +248,68 @@ bool XmaContextNew::Work() {
   return true;
 }
 
-void XmaContextNew::Enable() { set_is_enabled(true); }
-
-void XmaContextNew::Clear() {
-  std::lock_guard<xe_mutex> lock(lock_);
-
-  auto context_ptr = memory()->TranslateVirtual(guest_ptr());
-  XMA_CONTEXT_DATA data(context_ptr);
-  ClearLocked(&data);
-  data.Store(context_ptr);
+void XmaContextNew::Enable() {
+  std::lock_guard lock(global_lock_);
+  XELOGAPU("[{}ms] XmaContext {}: kicked", Clock::QueryHostUptimeMillis(),
+           id());
+  set_is_enabled(true);
 }
 
-void XmaContextNew::ClearLocked(XMA_CONTEXT_DATA* data) {
-  XELOGAPU("XmaContext: reset context {}", id());
+void XmaContextNew::Clear() {
+  std::lock_guard lock(global_lock_);
+  XELOGAPU("[{}ms] XmaContext {}: Clear requested (deferred)",
+           Clock::QueryHostUptimeMillis(), id());
+  clear_pending_.store(ClearOp::kClearForKick, std::memory_order_release);
+}
 
-  data->input_buffer_0_valid = 0;
-  data->input_buffer_1_valid = 0;
-  data->output_buffer_valid = 0;
+void XmaContextNew::ClearLocked(XMA_CONTEXT_DATA* data, ClearOp op) {
+  XELOGAPU("[{}ms] XmaContext {}: reset context (op={})",
+           Clock::QueryHostUptimeMillis(), id(), static_cast<int>(op));
 
-  data->input_buffer_read_offset = kBitsPerPacketHeader;
-  data->output_buffer_read_offset = 0;
-  data->output_buffer_write_offset = 0;
+  switch (op) {
+    case ClearOp::kClearForKick:
+      data->error_status = 0;
+      data->error_set = 0;
+      data->parser_error_status = 0;
+      data->parser_error_set = 0;
+      data->packet_metadata = 0;
+      break;
 
-  current_frame_remaining_subframes_ = 0;
-  loop_frame_output_limit_ = 0;
-  loop_start_skip_pending_ = false;
+    case ClearOp::kClearErrAck:
+      data->error_status = 0;
+      data->error_set = 0;
+      data->parser_error_status = 0;
+      data->parser_error_set = 0;
+      break;
+
+    case ClearOp::kClearFullReset:
+      data->output_buffer_write_offset = 0;
+      data->current_buffer = 0;
+      data->error_status = 0;
+      data->error_set = 0;
+      data->parser_error_status = 0;
+      data->parser_error_set = 0;
+      data->packet_metadata = 0;
+      current_frame_remaining_subframes_ = 0;
+      loop_frame_output_limit_ = 0;
+      loop_start_skip_pending_ = false;
+      remaining_subframe_blocks_in_output_buffer_ = 0;
+      break;
+
+    default:
+      break;
+  }
 }
 
 void XmaContextNew::Disable() { set_is_enabled(false); }
 
 void XmaContextNew::Release() {
   // Lock it in case the decoder thread is working on it now.
-  std::lock_guard<xe_mutex> lock(lock_);
+  std::lock_guard lock(global_lock_);
   assert_true(is_allocated());
 
   set_is_allocated(false);
-  auto context_ptr = memory()->TranslateVirtual(guest_ptr());
-  std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
+  std::memset(host_ptr_, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
 }
 
 int XmaContextNew::GetSampleRate(int id) {
@@ -277,8 +318,9 @@ int XmaContextNew::GetSampleRate(int id) {
 
 void XmaContextNew::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
   // No more frames.
-  XELOGAPU("XmaContext: SwapInputBuffer from buffer {} to {}",
-           data->current_buffer, data->current_buffer ^ 1);
+  XELOGAPU("[{}ms] XmaContext {}: SwapInputBuffer from buffer {} to {}",
+           Clock::QueryHostUptimeMillis(), id(), data->current_buffer,
+           data->current_buffer ^ 1);
   if (data->current_buffer == 0) {
     data->input_buffer_0_valid = 0;
   } else {
@@ -345,17 +387,11 @@ void XmaContextNew::Consume(RingBuffer* XE_RESTRICT output_rb,
       raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
       subframes_to_write * kOutputBytesPerBlock);
 
-  // Reserve extra blocks as headroom when unk_skip_decode is set.
-  // Only apply when the frame is fully consumed to avoid double-counting.
-  const int8_t headroom =
-      (current_frame_remaining_subframes_ - subframes_to_write == 0)
-          ? data->output_buffer_padding
-          : 0;
-
-  remaining_subframe_blocks_in_output_buffer_ -= subframes_to_write + headroom;
+  remaining_subframe_blocks_in_output_buffer_ -= subframes_to_write;
   current_frame_remaining_subframes_ -= subframes_to_write;
 
-  XELOGAPU("XmaContext {}: Consume: {} - {} - {} - {} - {}", id(),
+  XELOGAPU("[{}ms] XmaContext {}: Consume: {} - {} - {} - {} - {}",
+           Clock::QueryHostUptimeMillis(), id(),
            remaining_subframe_blocks_in_output_buffer_,
            data->output_buffer_write_offset, data->output_buffer_read_offset,
            output_rb->write_offset(), current_frame_remaining_subframes_);
@@ -407,11 +443,11 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
   }
 
   XELOGAPU(
-      "Processing context {} (offset {}, buffer {}, ptr {:p}, output buffer "
-      "{:08X}, output buffer count {})",
-      id(), data->input_buffer_read_offset, data->current_buffer,
-      static_cast<void*>(current_input_buffer), data->output_buffer_ptr,
-      data->output_buffer_block_count);
+      "[{}ms] Processing context {} (offset {}, buffer {}, ptr {:p}, output "
+      "buffer {:08X}, output buffer count {})",
+      Clock::QueryHostUptimeMillis(), id(), data->input_buffer_read_offset,
+      data->current_buffer, static_cast<void*>(current_input_buffer),
+      data->output_buffer_ptr, data->output_buffer_block_count);
 
   // Games like Dirt 2 can kick the decoder with read offset 0 (pointing into
   // the packet header) before filling in a valid offset. Clamp to the first
@@ -439,6 +475,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
   uint8_t* packet = current_input_buffer + (packet_index * kBytesPerPacket);
   const uint32_t packet_first_frame_offset = xma::GetPacketFrameOffset(packet);
   uint32_t relative_offset = data->input_buffer_read_offset % kBitsPerPacket;
+  data->packet_metadata = xma::GetPacketMetadata(packet);
 
   // If the read offset is before the first frame in this packet we're in the
   // tail of a split frame from the previous packet.  We don't have the
@@ -976,11 +1013,9 @@ void XmaContextNew::StoreContextMerged(const XMA_CONTEXT_DATA& data,
   fresh.input_buffer_read_offset = data.input_buffer_read_offset;
   fresh.error_status = data.error_status;
 
-  // DWORD 4: decoder owns current_buffer
+  // DWORD 4: decoder owns current_buffer and packet_metadata
   fresh.current_buffer = data.current_buffer;
-
-  // DWORD 9: decoder owns output_buffer_read_offset (reset by ClearLocked)
-  fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+  fresh.packet_metadata = data.packet_metadata;
 
   fresh.Store(context_ptr);
 }

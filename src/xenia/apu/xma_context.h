@@ -194,8 +194,20 @@ class XmaContext {
 
   static constexpr uint32_t kLastFrameMarker = 0x7FFF;
 
+  enum class ClearOp : uint8_t {
+    kNone = 0,
+    // Clear after kick - would keep most of the decoder state
+    kClearForKick,
+    // Clear out errors
+    kClearErrAck,
+    // Clear out all context state - called on disable
+    kClearFullReset
+  };
+
   explicit XmaContext();
   virtual ~XmaContext();
+
+  static std::recursive_mutex global_lock_;
 
   virtual int Setup(uint32_t id, Memory* memory, uint32_t guest_ptr) {
     return 0;
@@ -257,6 +269,7 @@ class XmaContext {
   xe_mutex lock_;
   std::atomic<bool> is_allocated_ = false;
   std::atomic<bool> is_enabled_ = false;
+  std::atomic<ClearOp> clear_pending_{ClearOp::kNone};
   std::unique_ptr<xe::threading::Event> work_completion_event_;
 
   // ffmpeg structures

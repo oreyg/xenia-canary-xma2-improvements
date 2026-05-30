@@ -66,8 +66,8 @@ class XmaContextNew : public XmaContext {
   void Release();
 
  private:
-  void ClearLocked(XMA_CONTEXT_DATA* data);
-  static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
+  void ClearLocked(XMA_CONTEXT_DATA* data, ClearOp op);
+  void SwapInputBuffer(XMA_CONTEXT_DATA* data);
   // Convert sampling rate from ID to frequency.
   static int GetSampleRate(int id);
   // Get the containing packet number of the frame pointed to by the offset.
@@ -127,6 +127,9 @@ class XmaContextNew : public XmaContext {
   // first byte contains bit offset information
   std::array<uint8_t, 1 + 4096> xma_frame_;
   std::array<uint8_t, kBytesPerFrameChannel * 2> raw_frame_;
+
+  // Pointer to this context's XMA_CONTEXT_DATA
+  uint8_t* host_ptr_ = nullptr;
 
   int32_t remaining_subframe_blocks_in_output_buffer_ = 0;
   uint8_t current_frame_remaining_subframes_ = 0;

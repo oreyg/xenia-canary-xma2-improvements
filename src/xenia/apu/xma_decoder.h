@@ -44,6 +44,9 @@ class XmaDecoder {
   void ReleaseContext(uint32_t guest_ptr);
   bool BlockOnContext(uint32_t guest_ptr, bool poll);
 
+  // Returns an unprotected alias to guest's context data.
+  // Safe to use from C++ and would not trigger MMIO mechanism.
+  uint8_t* GetContextDataHostPtr(uint32_t context_guest_ptr) const;
   uint32_t ReadRegister(uint32_t addr);
   void WriteRegister(uint32_t addr, uint32_t value);
 
@@ -57,9 +60,20 @@ class XmaDecoder {
  private:
   void WorkerThreadMain();
 
+  uint32_t OnContextDataRead(uint32_t guest_addr);
+  void OnContextDataWrite(uint32_t guest_addr, uint32_t value);
+
   static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as,
                                         uint32_t addr) {
     return as->ReadRegister(addr);
+  }
+  static uint32_t OnContextDataReadThunk(void* ppc_context, XmaDecoder* as,
+                                         uint32_t addr) {
+    return as->OnContextDataRead(addr);
+  }
+  static void OnContextDataWriteThunk(void* ppc_context, XmaDecoder* as,
+                                      uint32_t addr, uint32_t value) {
+    as->OnContextDataWrite(addr, value);
   }
   static void MMIOWriteRegisterThunk(void* ppc_context, XmaDecoder* as,
                                      uint32_t addr, uint32_t value) {
@@ -84,8 +98,19 @@ class XmaDecoder {
   XmaContext* contexts_[kContextCount];
   BitMap context_bitmap_;
 
+  // Context data is aligned by 32KB boundary relative to
+  // context_data_alloc_base_.
   uint32_t context_data_first_ptr_ = 0;
   uint32_t context_data_last_ptr_ = 0;
+
+  // 2^ Extent that covers all 320 contexts (320 * 64 = 20480 -> 32K).
+  static constexpr uint32_t kContextRegionSize = 0x8000;
+  // Memory that backs context data.
+  // Not equal to context_data_first_ptr_ - .
+  uint32_t context_data_alloc_base_ = 0;
+  // Cached pointer to the context-data.
+  // Use this from C++ code instead of TranslateVirtual.
+  uint8_t* context_data_host_unprotected_ = nullptr;
 };
 
 }  // namespace apu

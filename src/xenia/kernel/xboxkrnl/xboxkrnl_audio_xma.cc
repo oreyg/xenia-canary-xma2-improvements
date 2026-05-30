@@ -9,6 +9,7 @@
 
 #include "xenia/apu/audio_system.h"
 #include "xenia/apu/xma_decoder.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
@@ -55,10 +56,22 @@ using xe::apu::XMA_CONTEXT_DATA;
 // restrictions of frame/subframe/etc:
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.xaudio2.xaudio2_buffer(v=vs.85).aspx
 
+// Guests virtual range could be read-write protected:
+// Resolve through unprotected alias.
+static inline uint8_t* XmaContextHost(uint32_t guest_addr) {
+  return kernel_state()
+      ->emulator()
+      ->audio_system()
+      ->xma_decoder()
+      ->GetContextDataHostPtr(guest_addr);
+}
+
 dword_result_t XMACreateContext_entry(lpdword_t context_out_ptr) {
   auto xma_decoder = kernel_state()->emulator()->audio_system()->xma_decoder();
   uint32_t context_ptr = xma_decoder->AllocateContext();
   *context_out_ptr = context_ptr;
+  XELOGAPU("[{}ms] XMA kernel: CreateContext = {:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr);
   if (!context_ptr) {
     return X_STATUS_NO_MEMORY;
   }
@@ -68,6 +81,8 @@ DECLARE_XBOXKRNL_EXPORT2(XMACreateContext, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAReleaseContext_entry(lpvoid_t context_ptr) {
+  XELOGAPU("[{}ms] XMA kernel: ReleaseContext ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
   auto xma_decoder = kernel_state()->emulator()->audio_system()->xma_decoder();
   xma_decoder->ReleaseContext(context_ptr);
   return 0;
@@ -116,6 +131,8 @@ static_assert_size(XMA_CONTEXT_INIT, 56);
 
 dword_result_t XMAInitializeContext_entry(
     lpvoid_t context_ptr, pointer_t<XMA_CONTEXT_INIT> context_init) {
+  XELOGAPU("[{}ms] XMA kernel: InitializeContext ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
   // Input buffers may be null (buffer 1 in 415607D4).
   // Convert to host endianness.
   uint32_t input_buffer_0_guest_ptr = context_init->input_buffer_0_ptr;
@@ -156,9 +173,10 @@ dword_result_t XMAInitializeContext_entry(
     return X_E_FALSE;
   }
 
-  std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
+  uint8_t* host_ctx = XmaContextHost(context_ptr.guest_address());
+  std::memset(host_ctx, 0, sizeof(XMA_CONTEXT_DATA));
 
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(host_ctx);
 
   context.input_buffer_0_ptr = input_buffer_0_physical_address;
   context.input_buffer_0_packet_count =
@@ -181,9 +199,7 @@ dword_result_t XMAInitializeContext_entry(
   context.loop_subframe_end = context_init->loop_data.loop_subframe_end;
   context.loop_subframe_skip = context_init->loop_data.loop_subframe_skip;
 
-  context.Store(context_ptr);
-
-  StoreXmaContextIndexedRegister(kernel_state(), 0x1A80, context_ptr);
+  context.Store(XmaContextHost(context_ptr.guest_address()));
 
   return 0;
 }
@@ -192,7 +208,10 @@ DECLARE_XBOXKRNL_EXPORT2(XMAInitializeContext, kAudio, kImplemented,
 
 dword_result_t XMASetLoopData_entry(lpvoid_t context_ptr,
                                     pointer_t<XMA_LOOP_DATA> loop_data) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XELOGAPU("[{}ms] XMA kernel: SetLoopData ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
 
   context.loop_start = loop_data->loop_start;
   context.loop_end = loop_data->loop_end;
@@ -200,14 +219,19 @@ dword_result_t XMASetLoopData_entry(lpvoid_t context_ptr,
   context.loop_subframe_end = loop_data->loop_subframe_end;
   context.loop_subframe_skip = loop_data->loop_subframe_skip;
 
-  context.Store(context_ptr);
+  context.Store(XmaContextHost(context_ptr.guest_address()));
 
   return 0;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMASetLoopData, kAudio, kImplemented, kHighFrequency);
 
 dword_result_t XMAGetInputBufferReadOffset_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU(
+      "[{}ms] XMA kernel: GetInputBufferReadOffset ctx_ptr={:08X} value={}",
+      Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+      static_cast<uint32_t>(context.input_buffer_read_offset));
   return context.input_buffer_read_offset;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAGetInputBufferReadOffset, kAudio, kImplemented,
@@ -215,9 +239,14 @@ DECLARE_XBOXKRNL_EXPORT2(XMAGetInputBufferReadOffset, kAudio, kImplemented,
 
 dword_result_t XMASetInputBufferReadOffset_entry(lpvoid_t context_ptr,
                                                  dword_t value) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XELOGAPU(
+      "[{}ms] XMA kernel: SetInputBufferReadOffset ctx_ptr={:08X} value={}",
+      Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+      static_cast<uint32_t>(value));
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   context.input_buffer_read_offset = value;
-  context.Store(context_ptr);
+  context.Store(XmaContextHost(context_ptr.guest_address()));
 
   return 0;
 }
@@ -226,6 +255,10 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetInputBufferReadOffset, kAudio, kImplemented,
 
 dword_result_t XMASetInputBuffer0_entry(lpvoid_t context_ptr, lpvoid_t buffer,
                                         dword_t packet_count) {
+  XELOGAPU(
+      "[{}ms] XMA kernel: SetInputBuffer0 ctx_ptr={:08X} buffer={:08X} pkts={}",
+      Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+      buffer.guest_address(), static_cast<uint32_t>(packet_count));
   uint32_t buffer_physical_address =
       kernel_memory()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
@@ -236,12 +269,13 @@ dword_result_t XMASetInputBuffer0_entry(lpvoid_t context_ptr, lpvoid_t buffer,
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
 
   context.input_buffer_0_ptr = buffer_physical_address;
   context.input_buffer_0_packet_count = packet_count;
 
-  context.Store(context_ptr);
+  context.Store(XmaContextHost(context_ptr.guest_address()));
 
   return 0;
 }
@@ -249,16 +283,23 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetInputBuffer0, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAIsInputBuffer0Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU("[{}ms] XMA kernel: IsInputBuffer0Valid ctx_ptr={:08X} value={}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+           static_cast<uint32_t>(context.input_buffer_0_valid));
   return context.input_buffer_0_valid;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAIsInputBuffer0Valid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMASetInputBuffer0Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XELOGAPU("[{}ms] XMA kernel: SetInputBuffer0Valid ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   context.input_buffer_0_valid = 1;
-  context.Store(context_ptr);
+  context.Store(XmaContextHost(context_ptr.guest_address()));
 
   return 0;
 }
@@ -267,6 +308,10 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetInputBuffer0Valid, kAudio, kImplemented,
 
 dword_result_t XMASetInputBuffer1_entry(lpvoid_t context_ptr, lpvoid_t buffer,
                                         dword_t packet_count) {
+  XELOGAPU(
+      "[{}ms] XMA kernel: SetInputBuffer1 ctx_ptr={:08X} buffer={:08X} pkts={}",
+      Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+      buffer.guest_address(), static_cast<uint32_t>(packet_count));
   uint32_t buffer_physical_address =
       kernel_memory()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
@@ -277,12 +322,13 @@ dword_result_t XMASetInputBuffer1_entry(lpvoid_t context_ptr, lpvoid_t buffer,
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
 
   context.input_buffer_1_ptr = buffer_physical_address;
   context.input_buffer_1_packet_count = packet_count;
 
-  context.Store(context_ptr);
+  context.Store(XmaContextHost(context_ptr.guest_address()));
 
   return 0;
 }
@@ -290,41 +336,58 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetInputBuffer1, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAIsInputBuffer1Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU("[{}ms] XMA kernel: IsInputBuffer1Valid ctx_ptr={:08X} value={}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+           static_cast<uint32_t>(context.output_buffer_valid));
   return context.input_buffer_1_valid;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAIsInputBuffer1Valid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMASetInputBuffer1Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   context.input_buffer_1_valid = 1;
-  context.Store(context_ptr);
-
+  context.Store(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU("[{}ms] XMA kernel: SetInputBuffer1Valid ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
   return 0;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMASetInputBuffer1Valid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAIsOutputBufferValid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU("[{}ms] XMA kernel: IsOutputBufferValid ctx_ptr={:08X} value={}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+           static_cast<uint32_t>(context.output_buffer_valid));
   return context.output_buffer_valid;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAIsOutputBufferValid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMASetOutputBufferValid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   context.output_buffer_valid = 1;
-  context.Store(context_ptr);
-
+  context.Store(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU("[{}ms] XMA kernel: SetOutputBufferValid ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
   return 0;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMASetOutputBufferValid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAGetOutputBufferReadOffset_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU(
+      "[{}ms] XMA kernel: GetOutputBufferReadOffset ctx_ptr={:08X} value={}",
+      Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+      static_cast<uint32_t>(context.output_buffer_read_offset));
   return context.output_buffer_read_offset;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAGetOutputBufferReadOffset, kAudio, kImplemented,
@@ -332,29 +395,46 @@ DECLARE_XBOXKRNL_EXPORT2(XMAGetOutputBufferReadOffset, kAudio, kImplemented,
 
 dword_result_t XMASetOutputBufferReadOffset_entry(lpvoid_t context_ptr,
                                                   dword_t value) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   context.output_buffer_read_offset = value;
-  context.Store(context_ptr);
-
+  context.Store(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU(
+      "[{}ms] XMA kernel: SetOutputBufferReadOffset ctx_ptr={:08X} value={}",
+      Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+      static_cast<uint32_t>(value));
   return 0;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMASetOutputBufferReadOffset, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAGetOutputBufferWriteOffset_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU(
+      "[{}ms] XMA kernel: GetOutputBufferWriteOffset ctx_ptr={:08X} "
+      "value={}",
+      Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+      static_cast<uint32_t>(context.output_buffer_write_offset));
   return context.output_buffer_write_offset;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAGetOutputBufferWriteOffset, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAGetPacketMetadata_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  std::lock_guard lock(xe::apu::XmaContext::global_lock_);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
+  XELOGAPU("[{}ms] XMA kernel: GetPacketMetadata ctx_ptr={:08X} value={}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+           static_cast<uint32_t>(context.packet_metadata));
   return context.packet_metadata;
 }
 DECLARE_XBOXKRNL_EXPORT1(XMAGetPacketMetadata, kAudio, kImplemented);
 
 dword_result_t XMAEnableContext_entry(lpvoid_t context_ptr) {
+  XELOGAPU("[{}ms] XMA kernel: EnableContext ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
+  StoreXmaContextIndexedRegister(kernel_state(), 0x1A80, context_ptr);
   StoreXmaContextIndexedRegister(kernel_state(), 0x1940, context_ptr);
   return 0;
 }
@@ -363,6 +443,9 @@ DECLARE_XBOXKRNL_EXPORT2(XMAEnableContext, kAudio, kImplemented,
 
 dword_result_t XMADisableContext_entry(lpvoid_t context_ptr, dword_t wait) {
   X_HRESULT result = X_E_SUCCESS;
+  XELOGAPU("[{}ms] XMA kernel: DisableContext ctx_ptr={:08X} wait={}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address(),
+           static_cast<uint32_t>(wait));
   StoreXmaContextIndexedRegister(kernel_state(), 0x1A40, context_ptr);
   if (!kernel_state()
            ->emulator()
@@ -377,16 +460,20 @@ DECLARE_XBOXKRNL_EXPORT2(XMADisableContext, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMABlockWhileInUse_entry(lpvoid_t context_ptr) {
-  do {
-    XMA_CONTEXT_DATA context(context_ptr);
-    if (!context.input_buffer_0_valid && !context.input_buffer_1_valid) {
+  XELOGAPU("[{}ms] XMA kernel: BlockWhileInUse enter ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
+  // The XMA worker holds global_lock_ for the duration of its batch. Spin
+  // on try_lock so the kernel call waits until decoder isn't actively
+  // touching contexts.
+  while (true) {
+    std::unique_lock lock(xe::apu::XmaContext::global_lock_, std::try_to_lock);
+    if (lock.owns_lock()) {
       break;
     }
-    if (!context.work_buffer_ptr) {
-      break;
-    }
-    xe::threading::Sleep(std::chrono::milliseconds(1));
-  } while (true);
+    xe::threading::MaybeYield();
+  }
+  XELOGAPU("[{}ms] XMA kernel: BlockWhileInUse done ctx_ptr={:08X}",
+           Clock::QueryHostUptimeMillis(), context_ptr.guest_address());
   return 0;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMABlockWhileInUse, kAudio, kImplemented,

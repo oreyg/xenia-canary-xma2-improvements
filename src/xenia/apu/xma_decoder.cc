@@ -9,12 +9,15 @@
 
 #include "xenia/apu/xma_decoder.h"
 
+#include <chrono>
+
 #include "xenia/apu/xma_context.h"
 #include "xenia/apu/xma_context_fake.h"
 #include "xenia/apu/xma_context_master.h"
 #include "xenia/apu/xma_context_new.h"
 #include "xenia/apu/xma_context_old.h"
 
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -61,6 +64,12 @@ DEFINE_bool(use_dedicated_xma_thread, true,
             "better results, but decrease performance a bit.",
             "APU");
 
+DEFINE_int64(
+    xma_decode_throttle_ns, 0,
+    "Sleep this many nanoseconds after decoding each context, to mimic "
+    "hardware decode latency. 0 disables.",
+    "APU");
+
 DEFINE_string(
     xma_decoder, "new",
     "Decoder version used to process XMA audio.\n"
@@ -75,6 +84,30 @@ DEFINE_string(
 
 namespace xe {
 namespace apu {
+
+// High-precision sleep - does not rely on systems scheduler to wake in time.
+static void HighPrecisionSleep(int64_t total_ns) {
+  constexpr int64_t kChunkNs = 500000;      // 0.5 ms kernel-sleep chunks
+  constexpr int64_t kSpinTailNs = 1000000;  // busy-wait the last 1 ms
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::nanoseconds(total_ns);
+  for (;;) {
+    const int64_t remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline - std::chrono::steady_clock::now())
+            .count();
+    if (remaining <= 0) {
+      break;
+    }
+    if (remaining <= kSpinTailNs) {
+      while (std::chrono::steady_clock::now() < deadline) {
+        // busy-wait for precise wake-up
+      }
+      break;
+    }
+    xe::threading::NanoSleep(kChunkNs);
+  }
+}
 
 XmaDecoder::XmaDecoder(cpu::Processor* processor)
     : memory_(processor->memory()), processor_(processor) {}
@@ -138,15 +171,25 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
       reinterpret_cast<cpu::MMIOWriteCallback>(MMIOWriteRegisterThunk));
 
   // Setup XMA context data.
-  // The Xbox 360 kernel allocates the contexts with X_PAGE_NOCACHE |
-  // X_PAGE_READWRITE and writes MmGetPhysicalAddress for the address to the
-  // register.
-  context_data_first_ptr_ = memory()->SystemHeapAlloc(
-      sizeof(XMA_CONTEXT_DATA) * kContextCount, 256, kSystemHeapPhysical);
+  // We want a 32 KB-aligned guest address so that
+  // page-protect range cover exactly our 32 KB region.
+  context_data_alloc_base_ = memory()->SystemHeapAlloc(
+      kContextRegionSize * 2, 256, kSystemHeapPhysical);
+  // Manually align by 32KB boundary, 320 contexts total are 20KB,
+  // we have 12KB of slack so we cannot overshoot.
+  context_data_first_ptr_ =
+      (context_data_alloc_base_ + kContextRegionSize - 1) &
+      ~(kContextRegionSize - 1);
   context_data_last_ptr_ =
       context_data_first_ptr_ + (sizeof(XMA_CONTEXT_DATA) * kContextCount - 1);
   register_file_[XmaRegister::ContextArrayAddress] =
       memory()->GetPhysicalAddress(context_data_first_ptr_);
+
+  // Resolve the unprotected host alias once.
+  // Host and Guest are accessing different virual ranges -
+  // Guests is read-write protected, and handled through exception path.
+  context_data_host_unprotected_ = memory()->TranslatePhysical(
+      memory()->GetPhysicalAddress(context_data_first_ptr_));
 
   // Setup XMA contexts.
   for (int i = 0; i < kContextCount; ++i) {
@@ -169,6 +212,23 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
   }
   register_file_[XmaRegister::NextContextIndex] = 1;
   context_bitmap_.Resize(kContextCount);
+
+  // TODO(oreyg) if you want to have context sync on other platforms -
+  //             emit 128-bit load/store in mmio_handler.cc
+#if XE_ARCH_AMD64
+  // Register XMA context data for JIT-level read/write interception.
+  {
+    bool registered = memory_->AddVirtualMappedRange(
+        context_data_first_ptr_, 0xFFFF8000, kContextRegionSize, this,
+        reinterpret_cast<cpu::MMIOReadCallback>(OnContextDataReadThunk),
+        reinterpret_cast<cpu::MMIOWriteCallback>(OnContextDataWriteThunk));
+    XELOGAPU(
+        "XmaDecoder: context intercept register range={:08X} "
+        "mask=FFFF8000 size={:X} -> {}",
+        Clock::QueryHostUptimeMillis(), context_data_first_ptr_,
+        kContextRegionSize, registered ? "OK" : "FAIL");
+  }
+#endif
 
   worker_running_ = true;
   work_event_ = xe::threading::Event::CreateAutoResetEvent(false);
@@ -194,8 +254,12 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
 
 void XmaDecoder::WorkerThreadMain() {
   while (worker_running_) {
-    // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
+    if (cvars::xma_decode_throttle_ns > 0) {
+      HighPrecisionSleep(cvars::xma_decode_throttle_ns);
+    }
+
+    std::lock_guard batch_lock(XmaContext::global_lock_);
     for (uint32_t n = 0; n < kContextCount; n++) {
       bool worked = contexts_[n]->Work();
       if (worked) {
@@ -212,7 +276,9 @@ void XmaDecoder::WorkerThreadMain() {
     if (did_work) {
       continue;
     }
-    xe::threading::Wait(work_event_.get(), false);
+    if (cvars::xma_decode_throttle_ns == 0) {
+      xe::threading::Wait(work_event_.get(), false);
+    }
   }
 }
 
@@ -233,12 +299,23 @@ void XmaDecoder::Shutdown() {
     worker_thread_.reset();
   }
 
-  if (context_data_first_ptr_) {
-    memory()->SystemHeapFree(context_data_first_ptr_);
+  if (context_data_alloc_base_) {
+    memory()->SystemHeapFree(context_data_alloc_base_);
   }
-
+  context_data_alloc_base_ = 0;
   context_data_first_ptr_ = 0;
   context_data_last_ptr_ = 0;
+  context_data_host_unprotected_ = nullptr;
+}
+
+uint8_t* XmaDecoder::GetContextDataHostPtr(uint32_t context_guest_ptr) const {
+  if (!context_data_host_unprotected_ ||
+      context_guest_ptr < context_data_first_ptr_ ||
+      context_guest_ptr > context_data_last_ptr_) {
+    return nullptr;
+  }
+  return context_data_host_unprotected_ +
+         (context_guest_ptr - context_data_first_ptr_);
 }
 
 int XmaDecoder::GetContextId(uint32_t guest_ptr) {
@@ -280,6 +357,35 @@ bool XmaDecoder::BlockOnContext(uint32_t guest_ptr, bool poll) {
 
   XmaContext& context = *contexts_[context_id];
   return context.Block(poll);
+}
+
+uint32_t XmaDecoder::OnContextDataRead(uint32_t guest_addr) {
+  if (guest_addr < context_data_first_ptr_ ||
+      guest_addr >= context_data_first_ptr_ + kContextRegionSize) {
+    return *reinterpret_cast<uint32_t*>(memory()->TranslateVirtual(guest_addr));
+  }
+  //std::lock_guard lock(XmaContext::global_lock_);
+  const uint32_t offset = guest_addr - context_data_first_ptr_;
+  uint8_t* host = context_data_host_unprotected_ + offset;
+  uint32_t result = xe::byte_swap(*reinterpret_cast<uint32_t*>(host));
+  XELOGAPU("[{}ms] XmaContext read {} dword {:x} = {:08X}",
+           Clock::QueryHostUptimeMillis(), offset / 64, offset % 64, result);
+  return result;
+}
+
+void XmaDecoder::OnContextDataWrite(uint32_t guest_addr, uint32_t value) {
+  if (guest_addr < context_data_first_ptr_ ||
+      guest_addr >= context_data_first_ptr_ + kContextRegionSize) {
+    *reinterpret_cast<uint32_t*>(memory()->TranslateVirtual(guest_addr)) =
+        value;
+    return;
+  }
+  //std::lock_guard lock(XmaContext::global_lock_);
+  const uint32_t offset = guest_addr - context_data_first_ptr_;
+  uint8_t* host = context_data_host_unprotected_ + offset;
+  XELOGAPU("[{}ms] XmaContext write {} dword {:x} = {:08X}",
+           Clock::QueryHostUptimeMillis(), offset / 64, offset % 64, value);
+  *reinterpret_cast<uint32_t*>(host) = xe::byte_swap(value);
 }
 
 uint32_t XmaDecoder::ReadRegister(uint32_t addr) {
@@ -336,7 +442,10 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
 
     // The context ID is a bit in the range of the entire context array.
     const uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
-    const uint32_t kicked_value = value;
+    XELOGAPU("[{}ms] XmaDecoder: kick reg {} base {} mask {:08X}",
+             Clock::QueryHostUptimeMillis(), r - XmaRegister::Context0Kick,
+             base_context_id, value);
+    std::lock_guard batch_lock(XmaContext::global_lock_);
     while (value) {
       const uint32_t context_id = base_context_id + std::countr_zero(value);
       auto& context = *contexts_[context_id];
@@ -357,8 +466,6 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       const uint32_t context_id = base_context_id + std::countr_zero(value);
       auto& context = *contexts_[context_id];
       context.Disable();
-      // Ensure the worker isn't mid-processing this context.
-      context.Block(false);
       value &= value - 1;
     }
   } else if (r >= XmaRegister::Context0Clear &&
@@ -372,6 +479,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       context.Clear();
       value &= value - 1;
     }
+    // Signal the decoder thread to start processing.
+    work_event_->SetBoostPriority();
   } else {
     // 0601h (1804h) is written to with 0x02000000 and 0x03000000 around a lock
     // operation
