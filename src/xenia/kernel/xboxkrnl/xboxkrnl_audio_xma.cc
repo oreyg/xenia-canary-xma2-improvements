@@ -55,6 +55,16 @@ using xe::apu::XMA_CONTEXT_DATA;
 // restrictions of frame/subframe/etc:
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.xaudio2.xaudio2_buffer(v=vs.85).aspx
 
+// Guests virtual range could be read-write protected:
+// Resolve through unprotected alias.
+static inline uint8_t* XmaContextHost(uint32_t guest_addr) {
+  return kernel_state()
+      ->emulator()
+      ->audio_system()
+      ->xma_decoder()
+      ->GetContextDataHostPtr(guest_addr);
+}
+
 dword_result_t XMACreateContext_entry(lpdword_t context_out_ptr) {
   auto xma_decoder = kernel_state()->emulator()->audio_system()->xma_decoder();
   uint32_t context_ptr = xma_decoder->AllocateContext();
@@ -156,9 +166,10 @@ dword_result_t XMAInitializeContext_entry(
     return X_E_FALSE;
   }
 
-  std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
+  uint8_t* host_ctx = XmaContextHost(context_ptr.guest_address());
+  std::memset(host_ctx, 0, sizeof(XMA_CONTEXT_DATA));
 
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(host_ctx);
 
   context.input_buffer_0_ptr = input_buffer_0_physical_address;
   context.input_buffer_0_packet_count =
@@ -181,7 +192,7 @@ dword_result_t XMAInitializeContext_entry(
   context.loop_subframe_end = context_init->loop_data.loop_subframe_end;
   context.loop_subframe_skip = context_init->loop_data.loop_subframe_skip;
 
-  context.Store(context_ptr);
+  context.Store(host_ctx);
 
   StoreXmaContextIndexedRegister(kernel_state(), 0x1A80, context_ptr);
 
@@ -192,7 +203,8 @@ DECLARE_XBOXKRNL_EXPORT2(XMAInitializeContext, kAudio, kImplemented,
 
 dword_result_t XMASetLoopData_entry(lpvoid_t context_ptr,
                                     pointer_t<XMA_LOOP_DATA> loop_data) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
 
   context.loop_start = loop_data->loop_start;
   context.loop_end = loop_data->loop_end;
@@ -200,14 +212,14 @@ dword_result_t XMASetLoopData_entry(lpvoid_t context_ptr,
   context.loop_subframe_end = loop_data->loop_subframe_end;
   context.loop_subframe_skip = loop_data->loop_subframe_skip;
 
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMASetLoopData, kAudio, kImplemented, kHighFrequency);
 
 dword_result_t XMAGetInputBufferReadOffset_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   return context.input_buffer_read_offset;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAGetInputBufferReadOffset, kAudio, kImplemented,
@@ -215,9 +227,10 @@ DECLARE_XBOXKRNL_EXPORT2(XMAGetInputBufferReadOffset, kAudio, kImplemented,
 
 dword_result_t XMASetInputBufferReadOffset_entry(lpvoid_t context_ptr,
                                                  dword_t value) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
   context.input_buffer_read_offset = value;
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
@@ -236,12 +249,13 @@ dword_result_t XMASetInputBuffer0_entry(lpvoid_t context_ptr, lpvoid_t buffer,
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
 
   context.input_buffer_0_ptr = buffer_physical_address;
   context.input_buffer_0_packet_count = packet_count;
 
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
@@ -249,16 +263,17 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetInputBuffer0, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAIsInputBuffer0Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   return context.input_buffer_0_valid;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAIsInputBuffer0Valid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMASetInputBuffer0Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
   context.input_buffer_0_valid = 1;
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
@@ -277,12 +292,13 @@ dword_result_t XMASetInputBuffer1_entry(lpvoid_t context_ptr, lpvoid_t buffer,
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
 
   context.input_buffer_1_ptr = buffer_physical_address;
   context.input_buffer_1_packet_count = packet_count;
 
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
@@ -290,16 +306,17 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetInputBuffer1, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAIsInputBuffer1Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   return context.input_buffer_1_valid;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAIsInputBuffer1Valid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMASetInputBuffer1Valid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
   context.input_buffer_1_valid = 1;
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
@@ -307,16 +324,17 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetInputBuffer1Valid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAIsOutputBufferValid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   return context.output_buffer_valid;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAIsOutputBufferValid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMASetOutputBufferValid_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
   context.output_buffer_valid = 1;
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
@@ -324,7 +342,7 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetOutputBufferValid, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAGetOutputBufferReadOffset_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   return context.output_buffer_read_offset;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAGetOutputBufferReadOffset, kAudio, kImplemented,
@@ -332,9 +350,10 @@ DECLARE_XBOXKRNL_EXPORT2(XMAGetOutputBufferReadOffset, kAudio, kImplemented,
 
 dword_result_t XMASetOutputBufferReadOffset_entry(lpvoid_t context_ptr,
                                                   dword_t value) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
+  XMA_CONTEXT_DATA context(host_ptr);
   context.output_buffer_read_offset = value;
-  context.Store(context_ptr);
+  context.Store(host_ptr);
 
   return 0;
 }
@@ -342,14 +361,14 @@ DECLARE_XBOXKRNL_EXPORT2(XMASetOutputBufferReadOffset, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAGetOutputBufferWriteOffset_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   return context.output_buffer_write_offset;
 }
 DECLARE_XBOXKRNL_EXPORT2(XMAGetOutputBufferWriteOffset, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMAGetPacketMetadata_entry(lpvoid_t context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
+  XMA_CONTEXT_DATA context(XmaContextHost(context_ptr.guest_address()));
   return context.packet_metadata;
 }
 DECLARE_XBOXKRNL_EXPORT1(XMAGetPacketMetadata, kAudio, kImplemented);
@@ -377,8 +396,9 @@ DECLARE_XBOXKRNL_EXPORT2(XMADisableContext, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMABlockWhileInUse_entry(lpvoid_t context_ptr) {
+  uint8_t* host_ptr = XmaContextHost(context_ptr.guest_address());
   do {
-    XMA_CONTEXT_DATA context(context_ptr);
+    XMA_CONTEXT_DATA context(host_ptr);
     if (!context.input_buffer_0_valid && !context.input_buffer_1_valid) {
       break;
     }

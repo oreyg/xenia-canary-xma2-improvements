@@ -61,6 +61,10 @@ DEFINE_bool(use_dedicated_xma_thread, true,
             "better results, but decrease performance a bit.",
             "APU");
 
+DEFINE_bool(enable_xma_rw_detector, true,
+            "Enables XMA Context read/write detector.",
+            "APU");
+
 DEFINE_string(
     xma_decoder, "new",
     "Decoder version used to process XMA audio.\n"
@@ -138,15 +142,25 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
       reinterpret_cast<cpu::MMIOWriteCallback>(MMIOWriteRegisterThunk));
 
   // Setup XMA context data.
-  // The Xbox 360 kernel allocates the contexts with X_PAGE_NOCACHE |
-  // X_PAGE_READWRITE and writes MmGetPhysicalAddress for the address to the
-  // register.
-  context_data_first_ptr_ = memory()->SystemHeapAlloc(
-      sizeof(XMA_CONTEXT_DATA) * kContextCount, 256, kSystemHeapPhysical);
+  // We want a 32 KB-aligned guest address so that
+  // page-protect range cover exactly our 32 KB region.
+  context_data_alloc_base_ = memory()->SystemHeapAlloc(
+      kContextRegionSize * 2, 256, kSystemHeapPhysical);
+  // Manually align by 32KB boundary, 320 contexts total are 20KB,
+  // we have 12KB of slack so we cannot overshoot.
+  context_data_first_ptr_ =
+      (context_data_alloc_base_ + kContextRegionSize - 1) &
+      ~(kContextRegionSize - 1);
   context_data_last_ptr_ =
       context_data_first_ptr_ + (sizeof(XMA_CONTEXT_DATA) * kContextCount - 1);
   register_file_[XmaRegister::ContextArrayAddress] =
       memory()->GetPhysicalAddress(context_data_first_ptr_);
+
+  // Resolve the unprotected host alias once.
+  // Host and Guest are accessing different virtual ranges -
+  // Guests is read-write protected, and handled through exception path.
+  context_data_host_unprotected_ = memory()->TranslatePhysical(
+      memory()->GetPhysicalAddress(context_data_first_ptr_));
 
   // Setup XMA contexts.
   for (int i = 0; i < kContextCount; ++i) {
@@ -169,6 +183,24 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
   }
   register_file_[XmaRegister::NextContextIndex] = 1;
   context_bitmap_.Resize(kContextCount);
+
+  // TODO(oreyg) if you want to have context sync on other platforms -
+  //             emit 128-bit load/store in mmio_handler.cc
+#if XE_ARCH_AMD64
+  // Register XMA context data for JIT-level read/write interception.
+  if (cvars::enable_xma_rw_detector)
+  {
+    bool registered = memory_->AddVirtualMappedRange(
+        context_data_first_ptr_, 0xFFFF8000, kContextRegionSize, this,
+        reinterpret_cast<cpu::MMIOReadCallback>(OnContextDataReadThunk),
+        reinterpret_cast<cpu::MMIOWriteCallback>(OnContextDataWriteThunk));
+    XELOGAPU(
+        "XmaDecoder: context intercept register range={:08X} "
+        "mask=FFFF8000 size={:X} -> {}",
+        context_data_first_ptr_, kContextRegionSize,
+        registered ? "OK" : "FAIL");
+  }
+#endif
 
   worker_running_ = true;
   work_event_ = xe::threading::Event::CreateAutoResetEvent(false);
@@ -233,12 +265,23 @@ void XmaDecoder::Shutdown() {
     worker_thread_.reset();
   }
 
-  if (context_data_first_ptr_) {
-    memory()->SystemHeapFree(context_data_first_ptr_);
+  if (context_data_alloc_base_) {
+    memory()->SystemHeapFree(context_data_alloc_base_);
   }
-
+  context_data_alloc_base_ = 0;
   context_data_first_ptr_ = 0;
   context_data_last_ptr_ = 0;
+  context_data_host_unprotected_ = nullptr;
+}
+
+uint8_t* XmaDecoder::GetContextDataHostPtr(uint32_t context_guest_ptr) const {
+  if (!context_data_host_unprotected_ ||
+      context_guest_ptr < context_data_first_ptr_ ||
+      context_guest_ptr > context_data_last_ptr_) {
+    return nullptr;
+  }
+  return context_data_host_unprotected_ +
+         (context_guest_ptr - context_data_first_ptr_);
 }
 
 int XmaDecoder::GetContextId(uint32_t guest_ptr) {
@@ -280,6 +323,33 @@ bool XmaDecoder::BlockOnContext(uint32_t guest_ptr, bool poll) {
 
   XmaContext& context = *contexts_[context_id];
   return context.Block(poll);
+}
+
+uint32_t XmaDecoder::OnContextDataRead(uint32_t guest_addr) {
+  if (guest_addr < context_data_first_ptr_ ||
+      guest_addr >= context_data_first_ptr_ + kContextRegionSize) {
+    return *reinterpret_cast<uint32_t*>(memory()->TranslateVirtual(guest_addr));
+  }
+  const uint32_t offset = guest_addr - context_data_first_ptr_;
+  uint8_t* host = context_data_host_unprotected_ + offset;
+  uint32_t result = xe::byte_swap(*reinterpret_cast<uint32_t*>(host));
+  XELOGAPU("XmaContext read {} dword {:x} = {:08X}",
+           offset / 64, offset % 64, result);
+  return result;
+}
+
+void XmaDecoder::OnContextDataWrite(uint32_t guest_addr, uint32_t value) {
+  if (guest_addr < context_data_first_ptr_ ||
+      guest_addr >= context_data_first_ptr_ + kContextRegionSize) {
+    *reinterpret_cast<uint32_t*>(memory()->TranslateVirtual(guest_addr)) =
+        value;
+    return;
+  }
+  const uint32_t offset = guest_addr - context_data_first_ptr_;
+  uint8_t* host = context_data_host_unprotected_ + offset;
+  XELOGAPU("XmaContext write {} dword {:x} = {:08X}",
+           offset / 64, offset % 64, value);
+  *reinterpret_cast<uint32_t*>(host) = xe::byte_swap(value);
 }
 
 uint32_t XmaDecoder::ReadRegister(uint32_t addr) {

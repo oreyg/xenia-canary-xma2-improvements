@@ -128,6 +128,9 @@ class XmaContextNew : public XmaContext {
   std::array<uint8_t, 1 + 4096> xma_frame_;
   std::array<uint8_t, kBytesPerFrameChannel * 2> raw_frame_;
 
+  // Pointer to this context's XMA_CONTEXT_DATA
+  uint8_t* host_ptr_ = nullptr;
+
   int32_t remaining_subframe_blocks_in_output_buffer_ = 0;
   uint8_t current_frame_remaining_subframes_ = 0;
 

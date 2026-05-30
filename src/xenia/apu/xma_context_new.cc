@@ -48,6 +48,7 @@ int XmaContextNew::Setup(uint32_t id, Memory* memory, uint32_t guest_ptr) {
   id_ = id;
   memory_ = memory;
   guest_ptr_ = guest_ptr;
+  host_ptr_ = memory->TranslatePhysical(memory->GetPhysicalAddress(guest_ptr));
 
   // Allocate ffmpeg stuff:
   av_packet_ = av_packet_alloc();
@@ -118,7 +119,7 @@ bool XmaContextNew::Work() {
   std::lock_guard<xe_mutex> lock(lock_);
   set_is_enabled(false);
 
-  auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+  uint8_t* context_ptr = host_ptr_;
   XMA_CONTEXT_DATA data(context_ptr);
   const XMA_CONTEXT_DATA initial_data = data;
 
@@ -237,7 +238,7 @@ void XmaContextNew::Enable() { set_is_enabled(true); }
 void XmaContextNew::Clear() {
   std::lock_guard<xe_mutex> lock(lock_);
 
-  auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+  uint8_t* context_ptr = host_ptr_;
   XMA_CONTEXT_DATA data(context_ptr);
   ClearLocked(&data);
   data.Store(context_ptr);
@@ -267,8 +268,7 @@ void XmaContextNew::Release() {
   assert_true(is_allocated());
 
   set_is_allocated(false);
-  auto context_ptr = memory()->TranslateVirtual(guest_ptr());
-  std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
+  std::memset(host_ptr_, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
 }
 
 int XmaContextNew::GetSampleRate(int id) {
