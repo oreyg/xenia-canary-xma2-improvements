@@ -103,6 +103,10 @@ class AudioSystem {
   bool paused_ = false;
   threading::Fence pause_fence_;
   std::unique_ptr<threading::Event> resume_event_;
+
+  // Target time of the next mixer callback (in microseconds).
+  // Each client is pacing at it's own cadence.
+  uint64_t next_pump_us[kMaximumClientCount]{};
 };
 
 }  // namespace apu

@@ -14,6 +14,7 @@
 #include "xenia/apu/xma_decoder.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -41,6 +42,16 @@ DEFINE_uint32(apu_max_queued_frames, 8,
               "Value range: [4-64]",
               "APU");
 UPDATE_from_uint32(apu_max_queued_frames, 2024, 8, 31, 20, 64);
+
+DEFINE_uint32(apu_pump_interval_us, 5333,
+              "Desired interval between audio frames (1..5333, microseconds). "
+              "0 disables.",
+              "APU");
+
+DEFINE_uint32(apu_pump_interval_slack_us, 400,
+              "Wake this many microseconds before each frame's deadline to "
+              "absorb processing jitter.",
+              "APU");
 
 namespace xe {
 namespace apu {
@@ -135,6 +146,41 @@ void AudioSystem::WorkerThreadMain() {
       global_lock.unlock();
 
       if (client_callback) {
+        static auto SteadyNowUs = []() {
+          return static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count());
+        };
+
+        // Some games (4E4D0819 for example) rely on audio subsystem
+        // to derive their audio pace.
+        if (cvars::apu_pump_interval_us > 0) {
+          // Xenos audio subsystem operates at 5.333ms interval (see
+          // xaudio2_audio_driver.cc)
+          uint32_t pump_interval =
+              std::clamp(cvars::apu_pump_interval_us, 1u, 5333u);
+
+          // Interval scales inversely with guest_time_scalar.
+          const double scalar = xe::Clock::guest_time_scalar();
+          const uint64_t min_us =
+              scalar > 0.0 ? (uint64_t)(pump_interval / scalar) : pump_interval;
+
+          const uint64_t slack = cvars::apu_pump_interval_slack_us;
+          const uint64_t now = SteadyNowUs();
+          uint64_t next_pump_time = next_pump_us[index];
+          if (next_pump_time != 0 && now <= next_pump_time) {
+            // Wake early so processing time doesn't push us past the deadline.
+            const uint64_t remaining_us = next_pump_time - now;
+            if (remaining_us > slack) {
+              xe::threading::NanoSleepPrecise((remaining_us - slack) * 1000);
+            }
+          } else {
+            next_pump_time = now;
+          }
+          next_pump_us[index] = next_pump_time + min_us;
+        }
+
         SCOPE_profile_cpu_i("apu", "xe::apu::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
         processor_->Execute(worker_thread_->thread_state(), client_callback,
@@ -149,8 +195,7 @@ void AudioSystem::WorkerThreadMain() {
     }
 
     if (!pumped) {
-      SCOPE_profile_cpu_i("apu", "Sleep");
-      xe::threading::Sleep(std::chrono::milliseconds(500));
+      continue;
     }
   }
   worker_running_ = false;
@@ -269,6 +314,7 @@ void AudioSystem::UnregisterClient(size_t index) {
   DestroyDriver(clients_[index].driver);
   memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
   clients_[index] = {0};
+  next_pump_us[index] = 0;
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();
