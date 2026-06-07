@@ -1,0 +1,22 @@
+{
+  "//": "Point text_hook_config at a copy of this file. Every entry installs an independent hook; all run at once. address/source_register identify the hook; the rest are per-hook. Output (in-game vs clipboard) is global: see text_hook_output.",
+  "hooks": [
+    {
+      "address": "82274208",
+      "source_register": 4,
+      "length_register": 5,
+      "dest_register": 32,
+      "cooldown_ms": 3000,
+      "replace": "",
+      "dest_min": "0",
+      "dest_max": "0",
+      "translate": {
+        "max_chars": 0,
+        "wrap": 60,
+        "wrap_slack": 16,
+        "clamp_to_original": false,
+        "stack_max": 0
+      }
+    }
+  ]
+}

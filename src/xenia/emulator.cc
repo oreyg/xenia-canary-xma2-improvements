@@ -66,6 +66,7 @@
 #elif XE_ARCH_ARM64
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #endif  // XE_ARCH
+#include "xenia/loc/localization.h"
 
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
@@ -226,6 +227,10 @@ X_STATUS Emulator::Setup(
   XELOGI("{}: Initializing Exports...", __func__);
   // Shared export resolver used to attach and query for HLE exports.
   export_resolver_ = std::make_unique<xe::cpu::ExportResolver>();
+
+  // Register localization JIT prolog hooks before any guest code is translated.
+  // text_hook_config resolves relative to the storage root (like the config).
+  xe::loc::Initialize(storage_root_);
 
   std::unique_ptr<xe::cpu::backend::Backend> backend;
 #if XE_ARCH_AMD64

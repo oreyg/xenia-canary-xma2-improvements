@@ -41,6 +41,11 @@ enum class SimpleMessageBoxType {
 // This is expected to block the caller until the message box is closed.
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message);
 
+// Replaces the system clipboard contents with `text` (UTF-8). No-op on
+// platforms without clipboard support. May block on a busy clipboard - call
+// from a background thread if that matters.
+void SetClipboardText(const std::string_view text);
+
 }  // namespace xe
 
 #endif  // XENIA_BASE_SYSTEM_H_

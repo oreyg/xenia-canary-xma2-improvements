@@ -24,6 +24,7 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/vec128.h"
+#include "xenia/cpu/backend/guest_prolog_hook.h"
 #include "xenia/cpu/backend/x64/x64_backend.h"
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
@@ -262,6 +263,16 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
     EmitGetCurrentThreadId();
     lock();
     bts(qword[low_address(&trace_header->function_thread_use)], rax);
+  }
+
+  // Module-registered prolog hooks (e.g. xenia-loc: in-game text extraction,
+  // translation, and clipboard export). The backend stays agnostic - modules
+  // register their hooks during emulator setup.
+  for (const auto& prolog_hook : GuestPrologHooks()) {
+    if (prolog_hook.should_hook(current_guest_function_)) {
+      CallNative(prolog_hook.callback,
+                 static_cast<uint64_t>(current_guest_function_));
+    }
   }
 
   // Load membase.

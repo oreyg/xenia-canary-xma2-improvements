@@ -74,4 +74,8 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
 bool SetProcessPriorityClass(const uint32_t priority_class) { return true; }
 
 bool IsUseNexusForGameBarEnabled() { return false; }
+
+void SetClipboardText(const std::string_view text) {
+  // No clipboard integration on this platform yet.
+}
 }  // namespace xe

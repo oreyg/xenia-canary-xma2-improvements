@@ -64,6 +64,7 @@ target_link_libraries(xenia-app PRIVATE
   xenia-patcher
   xenia-ui
   xenia-vfs
+  xenia-loc
   # Third-party
   aes_128
   capstone

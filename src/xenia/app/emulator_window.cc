@@ -30,8 +30,13 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/system.h"
 #include "xenia/base/threading.h"
+#include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/function.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
+#include "xenia/loc/memory_scan.h"
+#include "xenia/memory.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
@@ -1108,6 +1113,18 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
 
     case ui::VirtualKey::kF9: {
       RunPreviouslyPlayedTitle();
+    } break;
+
+    case ui::VirtualKey::kScroll: {
+      xe::loc::ScanGuestMemoryForText(emulator()->memory());
+    } break;
+
+    case ui::VirtualKey::kHome: {
+      // First press after a hit drains the captured result; otherwise (re)arm.
+      if (!xe::loc::DumpMemoryWatchResult(emulator()->memory(),
+                                          emulator()->processor())) {
+        xe::loc::ArmMemoryWatch(emulator()->memory(), emulator()->processor());
+      }
     } break;
 
     default:

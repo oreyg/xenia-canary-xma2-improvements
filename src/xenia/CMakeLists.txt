@@ -18,6 +18,9 @@ endif()
 if(XE_TARGET_AARCH64)
   add_subdirectory(cpu/backend/a64)
 endif()
+# Localization (in-game text extraction/translation/clipboard). Backend-agnostic
+# except for the optional x64-only stackpoint diagnostics.
+add_subdirectory(loc)
 add_subdirectory(apu)
 add_subdirectory(apu/nop)
 add_subdirectory(gpu)

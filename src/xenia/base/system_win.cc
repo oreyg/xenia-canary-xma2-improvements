@@ -7,7 +7,9 @@
  ******************************************************************************
  */
 
+#include <cstring>
 #include <map>
+#include <string>
 #include "xenia/base/platform_win.h"
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
@@ -62,6 +64,23 @@ bool SetProcessPriorityClass(const uint32_t priority_class) {
 
   return SetPriorityClass(GetCurrentProcess(),
                           xeniaToWindowsPriorityClassMapping[priority_class]);
+}
+
+void SetClipboardText(const std::string_view text) {
+  if (!OpenClipboard(nullptr)) {
+    return;
+  }
+  EmptyClipboard();
+  const std::u16string wide = xe::to_utf16(text);
+  const size_t bytes = (wide.size() + 1) * sizeof(char16_t);
+  HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+  if (handle) {
+    void* dest = GlobalLock(handle);
+    std::memcpy(dest, wide.c_str(), bytes);
+    GlobalUnlock(handle);
+    SetClipboardData(CF_UNICODETEXT, handle);
+  }
+  CloseClipboard();
 }
 
 bool IsUseNexusForGameBarEnabled() {
