@@ -11,7 +11,6 @@
 #define XENIA_APU_AUDIO_SYSTEM_H_
 
 #include <atomic>
-#include <queue>
 
 #include "xenia/base/mutex.h"
 #include "xenia/base/threading.h"
@@ -85,6 +84,7 @@ class AudioSystem {
   static constexpr size_t kMaximumClientCount = 8;
   struct {
     AudioDriver* driver;
+    uint64_t next_pump_us;
     uint32_t callback;
     uint32_t callback_arg;
     uint32_t wrapped_callback_arg;
@@ -96,16 +96,11 @@ class AudioSystem {
   std::unique_ptr<xe::threading::Semaphore>
       client_semaphores_[kMaximumClientCount];
   // Event is always there in case we have no clients.
-  std::unique_ptr<xe::threading::Event> shutdown_event_;
-  xe::threading::WaitHandle* wait_handles_[kMaximumClientCount + 1];
+  std::unique_ptr<xe::threading::Event> pending_work_event_;
 
   bool paused_ = false;
   threading::Fence pause_fence_;
   std::unique_ptr<threading::Event> resume_event_;
-
-  // Target time of the next mixer callback (in microseconds).
-  // Each client is pacing at it's own cadence.
-  uint64_t next_pump_us[kMaximumClientCount]{};
 };
 
 }  // namespace apu
